@@ -502,6 +502,25 @@ def extract_entity(ent, noise, components):
             add(components, Component("Command bars", table, f"{table} ribbon", rflat, {}, table))
 
 
+CONNECTOR_ID_KEYS = {"connectionName", "connectionname", "apiId", "apiid", "connectionReferenceName", "connectionreferencename"}
+
+
+def _norm_connector_ids(node):
+    """Strip environment-specific instance suffixes (shared_office365-1a2b3c...) only from connector identifier
+    fields, so user data that happens to look similar (a file name such as shared_export-12345.csv) still compares."""
+    if isinstance(node, dict):
+        out = {}
+        for k, v in node.items():
+            if k in CONNECTOR_ID_KEYS and isinstance(v, str):
+                out[k] = re.sub(r"^(shared_[a-z0-9]+)-[0-9a-f]{5,}$", r"\1", v)
+            else:
+                out[k] = _norm_connector_ids(v)
+        return out
+    if isinstance(node, list):
+        return [_norm_connector_ids(v) for v in node]
+    return node
+
+
 def flow_actions(node, prefix="", out=None):
     if out is None:
         out = OrderedDict()
@@ -514,7 +533,7 @@ def flow_actions(node, prefix="", out=None):
         clean = {k: v for k, v in body.items() if k not in ("metadata", "runAfter", "actions", "else", "cases", "default")}
         if isinstance(body.get("cases"), dict):
             clean["cases"] = {cn: (c.get("case") if isinstance(c, dict) else c) for cn, c in body["cases"].items()}
-        canon = re.sub(r"(shared_[a-z0-9]+)-[0-9a-f]{5,}", r"\1", json.dumps(clean, sort_keys=True, default=str))
+        canon = json.dumps(_norm_connector_ids(clean), sort_keys=True, default=str)
         out[path] = {"type": body.get("type", ""), "hash": hashlib.sha256(canon.encode()).hexdigest()[:12],
             "runAfter": {k: (sorted(str(x) for x in v) if isinstance(v, list) else [str(v)]) for k, v in (body.get("runAfter") or {}).items()},
             "leaves": json_leaves(clean),
@@ -590,7 +609,7 @@ def flow_summary(pkg: Package, json_name: str):
             conns[k] = {"api": (v.get("api") or {}).get("name", ""),
                         "reference": (v.get("connection") or {}).get("connectionReferenceLogicalName", ""),
                         "runtimeSource": v.get("runtimeSource", "")}
-    canon = re.sub(r"(shared_[a-z0-9]+)-[0-9a-f]{5,}", r"\1", json.dumps(_strip_meta(definition), sort_keys=True, default=str))
+    canon = json.dumps(_norm_connector_ids(_strip_meta(definition)), sort_keys=True, default=str)
     return {"triggers": triggers, "actions": flow_actions(definition.get("actions")),
             "connections": conns, "parameters": json_leaves(_strip_meta(definition.get("parameters") or {})),
             "def_hash": hashlib.sha256(canon.encode()).hexdigest()[:12]}
@@ -730,9 +749,15 @@ def _yaml_flatten(text: str):
         if val.startswith(("|", ">")):
             block = []
             while i < len(lines) and (not lines[i].strip() or len(lines[i]) - len(lines[i].lstrip(" ")) > indent):
-                block.append(lines[i].strip())
+                block.append(lines[i].rstrip("\r"))
                 i += 1
-            out[path] = "\n".join(x for x in block if x)
+            # remove only the block's structural indentation (that of its first non-blank line); keep deeper
+            # indentation and blank lines inside the scalar, since both are content in a Power Fx string literal
+            lead = min((len(x) - len(x.lstrip(" ")) for x in block if x.strip()), default=0)
+            body_lines = [x[lead:] if x.strip() else "" for x in block]
+            while body_lines and not body_lines[-1].strip():
+                body_lines.pop()  # trailing blank lines are chomping, not content
+            out[path] = "\n".join(body_lines)
         else:
             out[path] = val.strip().strip('"').strip("'") if not val.startswith("=") else val
     return out
@@ -1270,7 +1295,7 @@ def cross_reference(results, bc, cc, flags):
                 item["used_by"] = users
                 notes.append(f"Web resource {item['key']} is used by: {', '.join(users)}")
     for item in results.get("Connection references", {}).get("added", []) + results.get("Connection references", {}).get("modified", []):
-        users = sorted(refs_new["connref_users"].get(item["key"], []))
+        users = sorted(set(item.get("used_by", [])) | set(refs_new["connref_users"].get(item["key"], [])))
         if users:
             item["used_by"] = users
             notes.append(f"Connection reference {item['key']} is used by: {', '.join(users)}")
