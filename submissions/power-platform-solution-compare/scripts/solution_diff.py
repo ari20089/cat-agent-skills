@@ -471,6 +471,59 @@ def add(components, comp: Component):
     components[(comp.ctype, comp.key)] = comp
 
 
+def fetch_column_refs(el, primary: str):
+    """Columns a view or chart reads, as 'table.column' lower-cased, attributed to their owning table: columns of the
+    primary entity to the primary table, link-entity columns to the linked table, conditions with `entityname` and
+    layout cells named `alias.column` to the aliased table."""
+    refs, alias = set(), {}
+
+    def walk(node, table):
+        for c in node:
+            tag = c.tag.lower()
+            if tag == "link-entity":
+                t = c.attrib.get("name") or table
+                if c.attrib.get("alias"):
+                    alias[c.attrib["alias"]] = t
+                walk(c, t)
+            elif tag == "attribute":
+                if c.attrib.get("name"):
+                    refs.add((table, c.attrib["name"]))
+            elif tag == "order":
+                if c.attrib.get("attribute"):
+                    refs.add((alias.get(c.attrib.get("alias", ""), table), c.attrib["attribute"]))
+            elif tag == "condition":
+                if c.attrib.get("attribute"):
+                    en = c.attrib.get("entityname", "")
+                    refs.add((alias.get(en, en) if en else table, c.attrib["attribute"]))
+                walk(c, table)
+            elif tag == "filter":
+                walk(c, table)
+            else:
+                walk(c, table)
+
+    fetches = [f for f in el.iter() if f.tag.lower() == "fetch"]
+    for holder in el.iter():  # charts carry their fetch as escaped text inside datadescription
+        if not len(holder) and holder.text and "<fetch" in holder.text:
+            try:
+                parsed = ET.fromstring(holder.text.strip())
+                fetches.extend([f for f in parsed.iter() if f.tag.lower() == "fetch"] or ([parsed] if parsed.tag.lower() == "fetch" else []))
+            except ET.ParseError:
+                pass
+    for fetch in fetches:
+        for ent in fetch:
+            if ent.tag.lower() == "entity":
+                walk(ent, ent.attrib.get("name") or primary)
+    for cell in el.iter():
+        if cell.tag.lower() == "cell" and cell.attrib.get("name"):
+            name = cell.attrib["name"]
+            if "." in name:
+                a, col = name.split(".", 1)
+                refs.add((alias.get(a, a), col))
+            else:
+                refs.add((primary, name))
+    return sorted(f"{t}.{c}".lower() for t, c in refs if t and c)
+
+
 def extract_entity(ent, noise, components):
     name_el = ent.find("Name")
     table = (name_el.text or "").strip() if name_el is not None else text(ent, "Name")
@@ -512,11 +565,12 @@ def extract_entity(ent, noise, components):
     for q in ent.findall("SavedQueries/savedqueries/savedquery"):
         qid = text(q, "savedqueryid").strip("{}").lower()
         add(components, Component("Views", f"{table}:{qid}", f"{table} / {localized_name(q) or qid}",
-                                  flatten(q, noise), {"query_type": text(q, "querytype"), "default": text(q, "isdefault")}, table))
+                                  flatten(q, noise), {"query_type": text(q, "querytype"), "default": text(q, "isdefault"),
+                                                      "column_refs": fetch_column_refs(q, table)}, table))
     for v in ent.findall("Visualizations/visualization"):
         vid = text(v, "savedqueryvisualizationid").strip("{}").lower()
         add(components, Component("Charts", f"{table}:{vid}", f"{table} / {localized_name(v) or vid}",
-                                  flatten(v, noise), {}, table))
+                                  flatten(v, noise), {"column_refs": fetch_column_refs(v, table)}, table))
     ribbon = ent.find("RibbonDiffXml")
     if ribbon is not None and len(ribbon):
         rflat = flatten(ribbon, noise)
@@ -1307,10 +1361,14 @@ def build_refs(components):
     for (ctype, key), c in components.items():
         if ctype in ("Forms", "Views", "Charts", "Dashboards"):
             table = c.parent or ""
-            cols = _ids_in(c.flat, ("/@datafieldname", "/@name", "/@uniqueid")) | _keyed(c.flat, ("attribute", "cell", "condition", "order", "control"))
-            for col in cols:
-                if table:
-                    idx["column_users"][f"{table}.{col}".lower()].add(f"{ctype[:-1].lower()} {c.label}")
+            if c.extra.get("column_refs") is not None:  # views and charts: each column attributed to its owning table
+                for ref in c.extra["column_refs"]:
+                    idx["column_users"][ref].add(f"{ctype[:-1].lower()} {c.label}")
+            else:
+                cols = _ids_in(c.flat, ("/@datafieldname", "/@name", "/@uniqueid")) | _keyed(c.flat, ("attribute", "cell", "condition", "order", "control"))
+                for col in cols:
+                    if table:
+                        idx["column_users"][f"{table}.{col}".lower()].add(f"{ctype[:-1].lower()} {c.label}")
             for lib in _keyed(c.flat, ("Library", "library")) | _ids_in(c.flat, ("/@libraryName", "/@libraryname", "/@library")):
                 idx["webresource_users"][lib].add(f"{ctype[:-1].lower()} {c.label}")
         if ctype in ("Model-driven apps", "Dashboards", "Sitemaps"):
@@ -1364,9 +1422,13 @@ def cross_reference(results, bc, cc, flags):
             if table in removed_tables or table.lower() not in app_tables:
                 continue  # the app does not use this table, or the whole table went (already flagged)
             disp = (item.get("extra") or {}).get("display", "")
-            hit = re.search(r"(?<![A-Za-z0-9_])" + re.escape(col) + r"(?![A-Za-z0-9_'])", formulas)
+            # schema/logical names: Power Fx shows them in the export's casing (contoso_LegacyCode or contoso_legacycode)
+            hit = re.search(r"(?<![A-Za-z0-9_])" + re.escape(col) + r"(?![A-Za-z0-9_'])", formulas, re.IGNORECASE)
             if not hit and disp and disp.lower() != col.lower() and len(disp) > 3:
-                hit = re.search(r"'" + re.escape(disp) + r"'", formulas)
+                hit = re.search(r"'" + re.escape(disp) + r"'", formulas, re.IGNORECASE)  # quoted display name
+                if not hit and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", disp):  # bare display identifier, exact case
+                    hit = re.search(r"(?<![A-Za-z0-9_'.]|\.)" + re.escape(disp) + r"(?![A-Za-z0-9_'])", formulas) or \
+                          re.search(r"\." + re.escape(disp) + r"(?![A-Za-z0-9_'])", formulas)
             if hit:
                 item.setdefault("still_used_by", []).append(f"canvas app {c.label}")
                 notes.append(f"Removed column {item['key']} is still referenced in formulas of canvas app {c.label}")
