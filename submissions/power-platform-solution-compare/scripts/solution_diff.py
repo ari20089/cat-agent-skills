@@ -257,6 +257,8 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
     """Flatten an element into {path: value} for leaf comparison.
 
     Path rules, chosen so that a path never changes because a sibling appeared or disappeared:
+    - the component root contributes its bare tag, so a rename does not move every leaf; its identifying
+      attributes (Name, ids) are recorded as `tag/@attr` leaves and compare like any other value;
     - keyed elements (see child_key) contribute `tag[key]`; identical keys among siblings get `#n`;
     - unkeyed elements with children and no attributes of their own are transparent wrappers when they
       are the only child of their tag: they add no segment and their children attach to the parent path;
@@ -272,7 +274,7 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
         counters = defaultdict(int)
     if el.tag in NOISE_TAGS and not noise:
         return out
-    key = child_key(el)
+    key = el.tag if root else child_key(el)  # identity of the component root is established by matching, not by its path
     keyed = key != el.tag
     has_children = len(el) > 0
     own_attrs = any(noise or a not in NOISE_TAGS for a in el.attrib)
@@ -642,7 +644,10 @@ def json_leaves(node, prefix="", out=None):
         for i, v in enumerate(node):
             json_leaves(v, f"{prefix}[{i}]", out)
     else:
-        out[prefix] = node if isinstance(node, (str, int, float, bool)) or node is None else str(node)
+        try:
+            out[prefix] = json.dumps(node) if isinstance(node, (str, int, float, bool)) or node is None else json.dumps(str(node))
+        except (TypeError, ValueError):
+            out[prefix] = json.dumps(str(node))
     return out
 
 
@@ -650,12 +655,12 @@ def leaf_diff_lines(old, new, limit=8):
     lines = []
     for k in old:
         if k not in new:
-            lines.append(f"{k}: {old[k]!r} removed")
+            lines.append(f"{k}: {old[k]} removed")
         elif old[k] != new[k]:
-            lines.append(f"{k}: {old[k]!r} → {new[k]!r}")
+            lines.append(f"{k}: {old[k]} → {new[k]}")
     for k in new:
         if k not in old:
-            lines.append(f"{k}: {new[k]!r} added")
+            lines.append(f"{k}: {new[k]} added")
     more = len(lines) - limit
     return lines[:limit] + ([f"… {more} more"] if more > 0 else [])
 
@@ -1607,10 +1612,10 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
             if p not in npar:
                 detail.append(f"parameter removed: {p}")
             elif op[p] != npar[p]:
-                detail.append(f"parameter changed: {p} ({op[p]!r} -> {npar[p]!r})")
+                detail.append(f"parameter changed: {p} ({op[p]} -> {npar[p]})")
         for p in npar:
             if p not in op:
-                detail.append(f"parameter added: {p} = {npar[p]!r}")
+                detail.append(f"parameter added: {p} = {npar[p]}")
         pchanged = [d for d in detail if d.startswith("parameter ")]
         if pchanged:
             flag(flags, "medium", "Cloud flows", key, f"{len(pchanged)} flow definition parameter(s) changed; defaults and dependent values change behavior")
@@ -1621,10 +1626,10 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
             if b not in nb:
                 bl.append(f"parameter binding removed: {b}")
             elif ob[b] != nb[b]:
-                bl.append(f"parameter binding changed: {b} ({ob[b]!r} -> {nb[b]!r})")
+                bl.append(f"parameter binding changed: {b} ({ob[b]} -> {nb[b]})")
         for b in nb:
             if b not in ob:
-                bl.append(f"parameter binding added: {b} = {nb[b]!r}")
+                bl.append(f"parameter binding added: {b} = {nb[b]}")
         detail.extend(bl)
         flag(flags, "medium", "Cloud flows", key, f"{len(bl)} runtime parameter binding(s) changed (properties.parameters); values used by @parameters() change")
     if not detail and old.get("def_hash") and new.get("def_hash") and old["def_hash"] != new["def_hash"]:
@@ -1687,6 +1692,9 @@ def assess(ctype, comp_old, comp_new, status, changes, flags, removed_parents=fr
                 flag(flags, "medium", ctype, label, "new required column on an existing table; existing records and integrations that create rows need a value")
         elif ctype in ("Plug-in steps", "Security roles", "Tables"):
             flag(flags, "low", ctype, label, "added; review for intent")
+        elif ctype in ("Classic workflows", "Business rules", "Business process flows", "Custom actions", "Cloud flows", "Desktop flows", "Dialogs"):
+            if str(comp_new.extra.get("state")) == "1":
+                flag(flags, "medium", ctype, label, "new process with activation state activated/on; it starts running after import once its connections are satisfied")
         return
     # modified
     if ctype == "Columns":
@@ -1940,7 +1948,7 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
                     detail.append("process definition (XAML) changed")
                 if t != "Cloud flows" and o.extra.get("json_hash") != n.extra.get("json_hash"):
                     detail.append("process definition (JSON) changed")
-                if changes or detail or extra_changed:
+                if all_changes or detail or extra_changed:  # the display limit must never decide the status
                     bucket["modified"].append({"key": k, "label": n.label, "changes": changes, "total_changes": total, "detail": detail,
                                                "extra": {kk: vv for kk, vv in n.extra.items() if kk not in ("flow", "options")}})
                     assess(t, o, n, "modified", all_changes, flags, removed_parents, added_parents, patch)
