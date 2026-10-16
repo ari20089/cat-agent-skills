@@ -24,6 +24,8 @@ A query body that returns agents and environments together, so the script can na
 }
 ```
 
+A page holds at most `Top` records. When the response has `resultTruncated` set or returns a `skipToken`, repeat the call with `Options.SkipToken` until it does not, save each page as its own file, and pass all the files to the script together; it merges them by ID. A run on a truncated page alone reports the export as incomplete in the header and the warnings, and owner counts, shared-connection dependents, and handovers then cover only the records supplied.
+
 The equivalent KQL for Azure Resource Graph:
 
 ```kusto

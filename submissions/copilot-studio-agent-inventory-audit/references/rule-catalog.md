@@ -1,6 +1,6 @@
 # Rule catalog
 
-Each rule the script evaluates: what triggers it, how severity is set, why it matters, what the inventory cannot prove, and where the fix lives. Severity is a review heuristic for ordering work. It is not a Microsoft rating and not a compliance verdict. A rule runs only when the export carries populated values for the fields it needs; the report lists the rules it skipped and why ("not in export" or "present but empty in every record").
+Each rule the script evaluates: what triggers it, how severity is set, why it matters, what the inventory cannot prove, and where the fix lives. Severity is a review heuristic for ordering work. It is not a Microsoft rating and not a compliance verdict. A rule runs only when the file the audited agents come from carries the fields it needs and the export populates them somewhere; the report lists the rules it skipped and why ("not in export", "not in the file the audited agents come from", or "present but empty in every record"). LC1 and OW2 are the exceptions: their evidence is an empty value, so they need only the column to exist. When an export is a truncated API page, the header says so and tenant-wide statements are not supported.
 
 Severity scale: **high** means exposure or loss of control to confirm this week; **medium** means a control gap to schedule; **low** means hygiene; **info** means a fact to know, not a defect.
 
@@ -26,7 +26,7 @@ Agent 365 and Entra governance attach to an agent's Microsoft Entra Agent ID, so
 
 ## Credentials
 
-**CR1 Maker-provided connection used for tools without end-user consent.** On a published agent, an enabled operation used as Tool or Topic Tool where `connectionProvider` is Maker, `requiresEndUserConsent` is false, and `whenCanBeUsed` is Anytime or absent from the export (the detail says which). Medium; high when the agent has no user authentication or is shared with the entire tenant. Drafts are left to LC1, which names their parked maker-provided connections. *Why:* the operation runs with the maker's permissions for every user, the orchestrator may call it whenever it judges fit, and the user is never asked. When ordering actions, lead with write operations (send mail, add rows, run scripts, create records). *Verify:* the maker's permissions in the target system and whether the operation writes. *Fix:* switch to a user-provided connection, enable end-user consent, restrict `whenCanBeUsed` to direct reference, or document the operation as a deliberate service action with an owner.
+**CR1 Maker-provided connection used for tools without end-user consent.** On a published agent, an enabled operation used as Tool or Topic Tool where `connectionProvider` is Maker, `requiresEndUserConsent` is explicitly false, and `whenCanBeUsed` is Anytime or absent from the export (the detail says which). An operation whose consent value is missing from the export is not assessed: the finding (if any) and a warning count those operations as unknown rather than treating them as no-consent. Medium; high when the agent has no user authentication or is shared with the entire tenant. Drafts are left to LC1, which names their parked maker-provided connections. *Why:* the operation runs with the maker's permissions for every user, the orchestrator may call it whenever it judges fit, and the user is never asked. When ordering actions, lead with write operations (send mail, add rows, run scripts, create records). *Verify:* the maker's permissions in the target system and whether the operation writes. *Fix:* switch to a user-provided connection, enable end-user consent, restrict `whenCanBeUsed` to direct reference, or document the operation as a deliberate service action with an owner.
 
 **CR2 Maker-provided connection used for knowledge.** `usedAs` Knowledge with `connectionProvider` Maker on a published agent. Medium. *Why:* results are limited only by what the maker's connection can see, not by the asking user's permissions. *Verify:* whether the source holds data with varying permissions. *Fix:* user-provided connection, or restrict the agent audience to people entitled to the full source.
 
@@ -38,7 +38,7 @@ Agent 365 and Entra governance attach to an agent's Microsoft Entra Agent ID, so
 
 ## Lifecycle
 
-**LC1 Draft never published.** `lastPublishedAt` empty and `createdAt` older than `--draft-days` (default 90). Low; medium when the draft holds maker connections, which the detail names as a parked credential rather than runtime exposure. *Verify:* with the owner. *Fix:* publish, delete, or justify.
+**LC1 Draft never published.** `lastPublishedAt` empty and `createdAt` older than `--draft-days` (default 90). Runs whenever the `lastPublishedAt` column exists, even if it is empty for every agent (an all-draft export). Low; medium when the draft holds maker connections, which the detail names as a parked credential rather than runtime exposure. *Verify:* with the owner. *Fix:* publish, delete, or justify.
 
 **LC2 Quarantined or blocked.** `isQuarantined` true. Medium. *Why:* a quarantine is an investigation nobody has closed. Makers can still test the agent; nobody can use it in a channel. *Fix:* finish the investigation; release through the Power Platform admin center or the quarantine API (Global, AI, or Power Platform administrator), or delete.
 
@@ -56,7 +56,7 @@ Agent 365 and Entra governance attach to an agent's Microsoft Entra Agent ID, so
 
 **OW1 Owner account disabled or departing.** Owner matches `--departing` (object ID, or UPN when a user list maps it) or is marked disabled, departed, or inactive in the `--users` file. High. *Why:* when the account goes, the agent is orphaned and the maker connections it uses stop working. *Fix:* reassign ownership with the Power Platform API reassign operation or PowerShell (Global, AI, Power Platform, or Environment administrator), or in Microsoft 365 admin center Agents for shared agents; the previous owner loses access and the new owner re-creates maker-provided connections. The owner-handover mode (`--owner`) lists everything that depends on one person.
 
-**OW2 No owner recorded.** `ownerId` empty on a published agent. Medium. *Fix:* assign an owner the same way.
+**OW2 No owner recorded.** `ownerId` empty on a published agent whose record carries the column. Medium. Runs even when every record has an empty owner; the detail then asks you to confirm that the export route carries owners before treating the agents as orphaned. *Fix:* assign an owner the same way.
 
 **OW3 Ownership concentration.** One owner holds at least `--owner-threshold` agents (default 15). Low, reported once per owner. *Why:* key-person risk. *Fix:* co-owners, documented transfer path, service accounts for platform-owned agents.
 

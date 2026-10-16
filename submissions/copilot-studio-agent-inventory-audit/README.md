@@ -51,6 +51,7 @@ python3 scripts/agent_inventory_audit.py agents.json --departing <object-id> --a
 - Connector detail (who provides the connection, whether consent is required, how the orchestrator may use it) is Preview data and is capped at 200 resources of each type per agent; the report flags agents above the cap.
 - Severity orders the work. It is this skill's heuristic, not a Microsoft rating and not a compliance verdict. Each finding says what to confirm in the live tenant before acting.
 - The report's reference date is used for age calculations; it is not the time the export was taken. Sharing, quarantine, and account state change daily, so note when the export was made.
+- The inventory API and `pac resource-query` return pages of up to 1,000 records. Pass every page file to the script together; a run on a truncated page is marked incomplete in the report header.
 - Finding IDs (F1, F2, …) are numbered per run; a `--brief`, `--environment`, `--agent`, or `--owner` run renumbers them, so quote the run you attach and cross-reference by rule ID.
 - Owners appear as object IDs unless you supply a user list or the admin center CSV already carries names. `--departing` by UPN needs the user list to map UPNs to object IDs.
 - Harness is derived from other fields when the export has no harness column; the report marks it.

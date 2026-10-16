@@ -41,7 +41,7 @@ import sys
 from collections import Counter, OrderedDict, defaultdict
 from datetime import datetime, timedelta, timezone
 
-TOOL_VERSION = "1.1.0"
+TOOL_VERSION = "1.2.0"
 AGENT_TYPE = "microsoft.copilotstudio/agents"
 ENV_TYPE = "microsoft.powerplatform/environments"
 
@@ -73,6 +73,13 @@ def value_blank(value):
     if isinstance(value, dict):
         return all(v is None for v in value.values())
     return is_blank(value)
+
+
+def field_blank(field, value):
+    """value_blank, except that the normalized authentication value "None" (no user authentication) is a real value."""
+    if field == "authentication":
+        return value is None
+    return value_blank(value)
 
 
 def parse_bool(value):
@@ -242,27 +249,50 @@ def table_records(container):
     return [dict(zip(cols, row)) for row in container["rows"] if isinstance(row, list)]
 
 
+def page_meta(payload):
+    """Pagination evidence from an inventory API / pac resource-query page, or Azure Resource Graph REST response."""
+    meta = {}
+    low = {norm_key(k): v for k, v in payload.items()}
+    for key, canon in (("totalrecords", "totalRecords"), ("count", "count"), ("resulttruncated", "resultTruncated"),
+                       ("skiptoken", "skipToken"), ("totalrecordscount", "totalRecords")):
+        if key in low and canon not in meta:
+            meta[canon] = low[key]
+    if "skipToken" not in meta and isinstance(low.get("$skiptoken"), str):
+        meta["skipToken"] = low["$skiptoken"]
+    truncated = meta.get("resultTruncated")
+    if isinstance(truncated, str):
+        truncated = truncated.strip().lower() in ("true", "1", "yes")
+    meta["truncated"] = bool(truncated) or not is_blank(meta.get("skipToken"))
+    total = meta.get("totalRecords")
+    try:
+        meta["totalRecords"] = int(total) if total is not None and not isinstance(total, bool) else None
+    except (TypeError, ValueError):
+        meta["totalRecords"] = None
+    return meta
+
+
 def unwrap_json(payload):
-    """Return (records, shape_label) from any supported JSON container."""
+    """Return (records, shape_label, page_meta) from any supported JSON container."""
     if isinstance(payload, list):
-        return [r for r in payload if isinstance(r, dict)], "JSON list"
+        return [r for r in payload if isinstance(r, dict)], "JSON list", {}
     if isinstance(payload, dict):
         if isinstance(payload.get("rows"), list) and isinstance(payload.get("columns"), list):
-            return table_records(payload), "Azure Resource Graph table (columns/rows)"
+            return table_records(payload), "Azure Resource Graph table (columns/rows)", {}
         for key in CONTAINER_KEYS:
             inner = payload.get(key)
             if isinstance(inner, list):
-                label = "inventory API / pac resource-query" if key == "data" and "totalRecords" in payload else "JSON object with '%s' array" % key
-                return [r for r in inner if isinstance(r, dict)], label
+                api = key == "data" and ("totalRecords" in payload or "resultTruncated" in payload or "skipToken" in payload)
+                label = "inventory API / pac resource-query" if api else "JSON object with '%s' array" % key
+                return [r for r in inner if isinstance(r, dict)], label, (page_meta(payload) if api else {})
             if isinstance(inner, dict) and isinstance(inner.get("rows"), list) and isinstance(inner.get("columns"), list):
-                return table_records(inner), "Azure Resource Graph REST (columns/rows)"
+                return table_records(inner), "Azure Resource Graph REST (columns/rows)", page_meta(payload)
         if "properties" in payload or "type" in payload:
-            return [payload], "single JSON record"
-    return [], "unrecognized JSON"
+            return [payload], "single JSON record", {}
+    return [], "unrecognized JSON", {}
 
 
 def load_file(path):
-    """Return (records, shape_label). Records are raw dicts."""
+    """Return (records, shape_label, page_meta). Records are raw dicts; page_meta is {} unless the file is an API page."""
     with open(path, "rb") as handle:
         raw = handle.read()
     text = raw.decode("utf-8-sig", errors="replace")
@@ -285,8 +315,8 @@ def load_file(path):
             if isinstance(item, dict):
                 records.append(item)
         if records:
-            return records, "newline-delimited JSON"
-        return [], "invalid JSON (could not be parsed as a JSON document or as newline-delimited JSON)"
+            return records, "newline-delimited JSON", {}
+        return [], "invalid JSON (could not be parsed as a JSON document or as newline-delimited JSON)", {}
     sample = text[:8192]
     try:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
@@ -304,7 +334,7 @@ def load_file(path):
             clean[str(key).strip()] = value
         if any(not is_blank(v) for v in clean.values()):
             records.append(clean)
-    return records, "CSV, %d columns" % len(reader.fieldnames or [])
+    return records, "CSV, %d columns" % len(reader.fieldnames or []), {}
 
 
 # --------------------------------------------------------------------------
@@ -645,7 +675,7 @@ DEPARTED_WORDS = ("disabled", "departed", "left", "terminated", "inactive", "off
 
 
 def load_users(path):
-    records, _ = load_file(path)
+    records, _, _ = load_file(path)
     users = {}
     for raw in records:
         flat = flatten(raw)
@@ -716,6 +746,7 @@ RULES = OrderedDict([
 ])
 
 # Fields each rule needs. "any:" groups mean at least one of the fields must be available.
+# "present:" means the column only has to exist in the audited records, because the rule's evidence is an empty value.
 RULE_FIELDS = {
     "ID1": ["any:entraAgentId,entraAppId,entraAgentBlueprintId"],
     "ID2": ["entraAppId"],
@@ -728,7 +759,7 @@ RULE_FIELDS = {
     "CR3": ["connectorOperations"],
     "CR4": ["powerPlatformConnectors"],
     "CR5": ["connectorOperations"],
-    "LC1": ["lastPublishedAt", "createdAt"],
+    "LC1": ["present:lastPublishedAt", "createdAt"],
     "LC2": ["isQuarantined"],
     "LC3": ["isManaged", "environmentType"],
     "LC4": ["environmentType"],
@@ -736,7 +767,7 @@ RULE_FIELDS = {
     "LC6": ["capabilitiesCounts"],
     "LC7": ["lastPublishedAt"],
     "OW1": ["ownerId"],
-    "OW2": ["ownerId"],
+    "OW2": ["present:ownerId"],
     "OW3": ["ownerId"],
     "RG1": ["location"],
     "MD1": ["model"],
@@ -769,6 +800,15 @@ class Audit:
         self.not_evaluated = OrderedDict()
         # Field coverage describes the export, so it is computed on all agents even when the audit is scoped.
         self.coverage = self._coverage(coverage_agents if coverage_agents is not None else agents)
+        # Rule availability also needs the field in the file(s) the audited agents come from, so a scoped audit
+        # of agents from a CSV is not enabled by fields that only another file carries. Optional JSON properties
+        # that happen to be unset for every in-scope agent still count, because their file carries them.
+        if coverage_agents is not None:
+            sources = set(a.get("_source") for a in agents)
+            self.scope_coverage = self._coverage([a for a in coverage_agents if a.get("_source") in sources])
+        else:
+            self.scope_coverage = self.coverage
+        self.gaps = []  # evidence gaps found while rules ran; reported as warnings
         self.departing = set(x.strip().lower() for x in (opts.departing or "").split(",") if x.strip())
         self.allowed_regions = set(x.strip().lower() for x in (opts.allowed_regions or "").split(",") if x.strip())
         self.watch_connectors = [x.strip().lower() for x in (opts.watch_connectors or "").split(",") if x.strip()]
@@ -785,7 +825,7 @@ class Audit:
                 value = a.get(field)
                 if field == "connectorOperations":
                     value = a.get("_connectorDetail") or None
-                if not value_blank(value):
+                if not field_blank(field, value):
                     populated += 1
             cov[field] = {"present": present, "populated": populated}
         return cov
@@ -796,16 +836,24 @@ class Audit:
     def fields_empty(self):
         return [f for f, c in self.coverage.items() if c["present"] > 0 and c["populated"] == 0]
 
+    def field_present(self, field):
+        """The field exists in at least one record of the file(s) the audited agents come from."""
+        return self.scope_coverage.get(field, {}).get("present", 0) > 0
+
     def field_available(self, field):
+        """The field exists in the audited agents' file(s) and the export populates it somewhere."""
         if field == "environmentType":
             return any((a.get("_env") or {}).get("type") for a in self.agents)
-        return self.coverage.get(field, {}).get("populated", 0) > 0
+        return self.field_present(field) and self.coverage.get(field, {}).get("populated", 0) > 0
 
     def field_reason(self, field):
         if field == "environmentType":
             return "environment type not in export or join"
-        cov = self.coverage.get(field, {"present": 0})
-        return "%s %s" % (field, "present but empty in every record" if cov["present"] else "not in export")
+        if not self.field_present(field):
+            if self.coverage.get(field, {}).get("present", 0) > 0:
+                return "%s not in the file the audited agents come from" % field
+            return "%s not in export" % field
+        return "%s present but empty in every record" % field
 
     def rule_available(self, rule):
         missing = []
@@ -814,6 +862,9 @@ class Audit:
                 names = req[4:].split(",")
                 if not any(self.field_available(f) for f in names):
                     missing.append("no identity column (%s) populated" % ", ".join(names))
+            elif req.startswith("present:"):
+                if not self.field_present(req[8:]):
+                    missing.append(self.field_reason(req[8:]))
             elif not self.field_available(req):
                 missing.append(self.field_reason(req))
         if missing:
@@ -1017,10 +1068,13 @@ class Audit:
                 self.add("EX4", "low", [a], "Editor access is shared with %s and %s. Every editor can change and republish the agent." % (plural(users, "user"), plural(groups, "group")))
 
     def rule_CR1(self):
+        unknown_ops = 0
+        unknown_agents = 0
         for a in self.agents:
             if a.get("published") is False:
                 continue  # drafts are covered by LC1
             hits = []
+            consent_unknown = []
             unknown_when = False
             for cid, op in self._ops(a):
                 if op.get("isEnabled") is False:
@@ -1033,11 +1087,18 @@ class Audit:
                 when = str(op.get("whenCanBeUsed", "") or "").lower().replace(" ", "")
                 if when and when != "anytime":
                     continue
+                consent = op.get("requiresEndUserConsent")
+                if consent is True:
+                    continue
+                if consent is not False:
+                    consent_unknown.append("%s.%s" % (cid, op.get("operationId") or "?"))
+                    continue
                 if not when:
                     unknown_when = True
-                if op.get("requiresEndUserConsent") is True:
-                    continue
                 hits.append("%s.%s" % (cid, op.get("operationId") or "?"))
+            if consent_unknown:
+                unknown_ops += len(consent_unknown)
+                unknown_agents += 1
             if not hits:
                 continue
             severity = "high" if (self.anonymous(a) or self.entire_tenant(a)) else "medium"
@@ -1051,7 +1112,14 @@ class Audit:
                 detail += "; the agent is shared with the entire tenant."
             else:
                 detail += "."
+            if consent_unknown:
+                n = len(consent_unknown)
+                detail += " %s on the same agent %s no requiresEndUserConsent value in the export and %s not assessed." % (
+                    plural(n, "more maker-provided tool operation", "more maker-provided tool operations"), "has" if n == 1 else "have", "was" if n == 1 else "were")
             self.add("CR1", severity, [a], detail, operations=hits)
+        if unknown_ops:
+            self.gaps.append("CR1: %s on %s %s no requiresEndUserConsent value in the export, so consent is unknown and no finding was raised for %s. Check each tool's connection settings in Copilot Studio." % (
+                plural(unknown_ops, "maker-provided tool operation"), plural(unknown_agents, "published agent"), "has" if unknown_ops == 1 else "have", "it" if unknown_ops == 1 else "them"))
 
     def rule_CR2(self):
         for a in self.agents:
@@ -1169,9 +1237,14 @@ class Audit:
                 self.add("OW1", "high", [a], "Owner %s is %s. When the account is removed the agent has no owner and any maker-provided connection it uses stops working." % (self.owner_label(a), why))
 
     def rule_OW2(self):
+        none_populated = self.coverage.get("ownerId", {}).get("populated", 0) == 0
         for a in self.agents:
-            if not a.get("ownerId") and self.is_published(a):
-                self.add("OW2", "medium", [a], "No owner recorded for a published agent. Assign an owner with the Power Platform API reassign operation or PowerShell.")
+            if "ownerId" not in a["_present"] or a.get("ownerId") or not self.is_published(a):
+                continue
+            detail = "No owner recorded for a published agent. Assign an owner with the Power Platform API reassign operation or PowerShell."
+            if none_populated:
+                detail += " Every record in this export has an empty owner, so confirm that the export route carries owners (the admin center inventory and the inventory API do) before treating this as an orphaned agent."
+            self.add("OW2", "medium", [a], detail)
 
     def rule_OW3(self):
         counts = Counter(a.get("ownerId") for a in self.agents if a.get("ownerId"))
@@ -1232,8 +1305,10 @@ def build_summary(audit):
     drafts = [a for a in agents if a.get("published") is False]
     unknown = [a for a in agents if a.get("published") is None]
 
-    def measure(field, value):
-        return value if audit.field_available(field) else None
+    def measure(fields, value):
+        if isinstance(fields, str):
+            fields = (fields,)
+        return value if all(audit.field_available(f) for f in fields) else None
 
     summary = OrderedDict()
     summary["agents"] = len(agents)
@@ -1244,7 +1319,7 @@ def build_summary(audit):
     summary["owners"] = len(set(a.get("ownerId") for a in agents if a.get("ownerId")))
     summary["quarantined"] = measure("isQuarantined", sum(1 for a in agents if a.get("isQuarantined") is True))
     summary["entireTenant"] = measure("sharedWithViewers", sum(1 for a in agents if audit.entire_tenant(a)))
-    summary["anonymousPublished"] = measure("authentication", sum(1 for a in agents if audit.anonymous(a) and audit.is_published(a) and a["channels"]))
+    summary["anonymousPublished"] = measure(("authentication", "channels"), sum(1 for a in agents if audit.anonymous(a) and audit.is_published(a) and a["channels"]))
     summary["webSearch"] = measure("isWebSearchEnabledForKnowledge", sum(1 for a in agents if a.get("isWebSearchEnabledForKnowledge") is True))
     summary["findingsBySeverity"] = OrderedDict((s, by_sev.get(s, 0)) for s in SEVERITY_ORDER)
     summary["agentsWithHigh"] = sum(1 for a in agents if any(f["severity"] == "high" for f in a["_findings"]))
@@ -1467,7 +1542,7 @@ def build_identity_migration(audit):
 # --------------------------------------------------------------------------
 
 SEV_LABEL = {"high": "High", "medium": "Medium", "low": "Low", "info": "Info"}
-MEASURE_FIELDS = {"entireTenant": "sharedWithViewers", "anonymousPublished": "authentication", "webSearch": "isWebSearchEnabledForKnowledge", "quarantined": "isQuarantined"}
+MEASURE_FIELDS = {"entireTenant": ("sharedWithViewers",), "anonymousPublished": ("authentication", "channels"), "webSearch": ("isWebSearchEnabledForKnowledge",), "quarantined": ("isQuarantined",)}
 
 LOCATION = {
     "ID1": "Copilot Studio > Settings > Advanced > Metadata; Microsoft Entra admin center > Agents",
@@ -1575,6 +1650,9 @@ def not_evaluated_text(audit):
         elif "present but empty" in reason:
             key = ("field present but empty in every record", "re-export with the field populated, or check in Copilot Studio")
             label = "%s (%s)" % (rule, reason.split(" present")[0])
+        elif "not in the file the audited agents" in reason:
+            key = ("field not in the file the audited agents come from", "another file in the export carries it; re-export the audited agents through the inventory API or Azure Resource Graph")
+            label = "%s (%s)" % (rule, reason.split(" not in")[0])
         elif "environment type" in reason:
             key = ("environment type not in export or join", "pass --environments with an environment export")
             label = rule
@@ -1605,6 +1683,8 @@ def render_header(ctx, brief=False):
     if ctx["excluded"]:
         scope += " of %d agent records (%d outside the requested scope)" % (len(audit.agents) + ctx["excluded"], ctx["excluded"])
     rows.append(("Agents audited", scope))
+    if ctx["exportComplete"] is False:
+        rows.append(("Export completeness", "INCOMPLETE: a page was truncated or records are missing (see Warnings); tenant-wide statements are not supported"))
     rows.append(("Reference date (--as-of)", fmt_dt(opts.as_of_dt) + " (used for age calculations; not the export time)"))
     if not brief:
         rows.append(("Environment records in export", ctx["env_records"]))
@@ -1683,10 +1763,12 @@ def render_owner_work(ctx):
 def na_text(audit, key, value):
     if value is not None:
         return value
-    field = MEASURE_FIELDS.get(key)
-    if field and audit.coverage.get(field, {}).get("present", 0) > 0:
-        return "n/a (empty in export)"
-    return "n/a (not in export)"
+    fields = MEASURE_FIELDS.get(key) or ()
+    missing = [f for f in fields if not audit.field_available(f)]
+    named = (" " + ", ".join(missing)) if len(fields) > 1 and missing else ""
+    if missing and all(audit.field_present(f) for f in missing):
+        return "n/a (%s empty in export)" % named.strip() if named else "n/a (empty in export)"
+    return "n/a (%s not in export)" % named.strip() if named else "n/a (not in export)"
 
 
 def render_measures(ctx):
@@ -1939,6 +2021,8 @@ def render_dossier(ctx, agent):
     header = "Source: %s. Reference date %s (not the export time). Tool %s." % ("; ".join(os.path.basename(p) for p, _, _ in ctx["sources"]), fmt_dt(opts.as_of_dt), TOOL_VERSION)
     if audit.not_evaluated:
         header += " Not evaluated: %s." % not_evaluated_text(audit)
+    if ctx["exportComplete"] is False:
+        header += " EXPORT INCOMPLETE: a page was truncated, so shared-connection dependents and owner counts may be missing."
     lines.append(header)
     lines.append("")
     lines.append(RUN_NOTE)
@@ -2054,6 +2138,8 @@ def render_handover(ctx, owner_key):
         owner_key, (", " + state) if state else "", "; ".join(os.path.basename(p) for p, _, _ in ctx["sources"]), fmt_dt(opts.as_of_dt), TOOL_VERSION)
     if audit.not_evaluated:
         header += " Not evaluated: %s." % not_evaluated_text(audit)
+    if ctx["exportComplete"] is False:
+        header += " EXPORT INCOMPLETE: a page was truncated, so agents this owner holds and the agents that depend on their connections may be missing from this list."
     lines.append(header)
     lines.append("")
     lines.append(RUN_NOTE)
@@ -2240,6 +2326,7 @@ def build_json(ctx):
         ("sources", [{"path": p, "shape": s, "records": n} for p, s, n in ctx["sources"]]),
         ("scope", {"environmentFilter": ctx["opts"].environment, "agentFilter": ctx["opts"].agent, "ownerFilter": ctx["opts"].owner, "excluded": ctx["excluded"]}),
         ("warnings", ctx["warnings"]),
+        ("exportComplete", ctx["exportComplete"]),
         ("fieldCoverage", audit.coverage),
         ("fieldsAbsent", audit.fields_absent()),
         ("fieldsPresentButEmpty", audit.fields_empty()),
@@ -2360,11 +2447,14 @@ def main(argv=None):
     env_records = 0
     other_types = Counter()
 
+    pages = []  # (file, records, meta) for API-shaped files, to judge completeness across pages
     for path in opts.inventory:
         if not os.path.isfile(path):
             parser.error("not a file: %s" % path)
-        records, shape = load_file(path)
+        records, shape, meta = load_file(path)
         sources.append((path, shape, len(records)))
+        if meta:
+            pages.append((os.path.basename(path), len(records), meta))
         if not records:
             warnings.append("%s: no records recognized (%s)." % (os.path.basename(path), shape))
             continue
@@ -2381,8 +2471,27 @@ def main(argv=None):
             else:
                 other_types[rec["type"]] += 1
 
+    export_complete = None  # None: no pagination evidence; True/False otherwise
+    if pages:
+        supplied = sum(n for _, n, _ in pages)
+        totals = [m["totalRecords"] for _, _, m in pages if m.get("totalRecords") is not None]
+        expected = max(totals) if totals else None
+        truncated = [name for name, _, m in pages if m.get("truncated")]
+        if expected is not None and supplied >= expected:
+            export_complete = True
+        elif truncated:
+            export_complete = False
+            missing = " %d of %d records supplied;" % (supplied, expected) if expected is not None else ""
+            warnings.append("Export incomplete: %s %s a truncated page (resultTruncated or skipToken set).%s request the remaining pages with skipToken and pass all page files together before drawing tenant-wide conclusions. Ownership counts, shared-connection dependencies, and owner handovers cover only the records supplied." % (
+                ", ".join(truncated), "is" if len(truncated) == 1 else "are", missing))
+        elif expected is not None and supplied < expected:
+            export_complete = False
+            warnings.append("Export incomplete: %d of %d records supplied (totalRecords in the page header). Request the remaining pages and pass all page files together before drawing tenant-wide conclusions." % (supplied, expected))
+        else:
+            export_complete = True
+
     if opts.environments:
-        records, _ = load_file(opts.environments)
+        records, _, _ = load_file(opts.environments)
         for raw in records:
             env = environment_from_record(raw)
             if env:
@@ -2399,8 +2508,8 @@ def main(argv=None):
             for field in FIELD_ALIASES:
                 if field not in rec["_present"] or field == "powerPlatformConnectors":
                     continue
-                if field not in first["_present"] or value_blank(first.get(field)):
-                    if not value_blank(rec.get(field)) or field not in first["_present"]:
+                if field not in first["_present"] or field_blank(field, first.get(field)):
+                    if not field_blank(field, rec.get(field)) or field not in first["_present"]:
                         first[field] = rec[field]
                         if field == "lastPublishedAt":
                             first["_rawLastPublished"] = rec.get("_rawLastPublished")
@@ -2474,6 +2583,7 @@ def main(argv=None):
         if not matched:
             warnings.append("--departing value '%s' matched no owner in the audited scope%s." % (value, "" if users else "; UPNs need --users to map to object IDs"))
     audit.run()
+    warnings.extend(audit.gaps)
 
     dossier = None
     if opts.agent:
@@ -2487,7 +2597,7 @@ def main(argv=None):
             parser.error(error)
 
     ctx = {
-        "audit": audit, "opts": opts, "sources": sources, "warnings": warnings, "excluded": excluded,
+        "audit": audit, "opts": opts, "sources": sources, "warnings": warnings, "excluded": excluded, "exportComplete": export_complete,
         "other_types": other_types, "env_records": env_records, "env_total": env_total, "env_resolved": env_resolved,
         "user_count": user_count, "owners_resolved": owners_resolved, "owners_total": len(owner_keys),
         "dossier": dossier, "handover": handover,

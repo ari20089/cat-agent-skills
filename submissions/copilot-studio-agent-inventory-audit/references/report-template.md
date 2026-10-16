@@ -12,6 +12,7 @@ The script's Markdown report is the raw audit; the shapes below are what you bui
 | Item | Value |
 | Sources | agents.json (inventory API / pac resource-query, 312 records) |
 | Agents audited | 287 of 300 agent records (13 outside the requested scope) |
+| Export completeness | INCOMPLETE: … (only when an API page was truncated) |
 | Reference date (--as-of) | 2026-10-16 (used for age calculations; not the export time) |
 | Environment records in export | 12 |
 | Environments joined | 287 of 287 environment IDs resolved to a name |
@@ -19,9 +20,9 @@ The script's Markdown report is the raw audit; the shapes below are what you bui
 | Field coverage | 29 of 30 fields present; absent: harness; present but empty: sharedWithEditors |
 | Rules not evaluated | EX4 (sharedWithEditors): field present but empty in every record (re-export …); RG1: --allowed-regions not supplied (pass --allowed-regions to check) |
 | Not visible to this audit | instructions, knowledge content, usage, … |
-| Tool | agent_inventory_audit.py 1.1.0 |
+| Tool | agent_inventory_audit.py 1.2.0 |
 
-## Warnings
+## Warnings (only when there is something to say: an incomplete API page, unresolved environments, unparsed dates, consent values missing)
 ## Posture summary
 | Measure | Count |
 | Shared with the entire tenant | 6 |

@@ -80,7 +80,8 @@ How to read it:
 
 - **Reference date** is the date the script used for age calculations, set by `--as-of` or the run date. It is not when the export was taken; ask for that and state both.
 - **Records versus agents audited.** The difference is environment records, duplicates merged by ID, or records outside a `--environment` scope; the header names each.
-- **Rules not evaluated** means the export lacks populated values for the fields; it says nothing about the tenant.
+- **Export completeness.** If the header says INCOMPLETE, the API page was truncated. Report only what the supplied records show, say that counts, owner lists, and shared-connection dependents are partial, and ask for the remaining pages (field catalog) before any tenant-wide statement.
+- **Rules not evaluated** means the export lacks populated values for the fields; it says nothing about the tenant. A CR1 warning that consent values are missing means those operations were not assessed, not that they are safe.
 - **Harness (derived)** means the export had no harness field and the script inferred it from other fields.
 - **Truncated tables.** Tables stop at 25 rows by default and end with "… and N more (F26, …)". Those findings exist but are not in the paste; count them in totals, do not describe them, and ask for `--max-rows` or the JSON before detailing that rule.
 - **Finding IDs are per run.** A brief, scoped, dossier, or handover run renumbers them; cite the run you attach and cross-reference by rule ID.
