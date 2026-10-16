@@ -281,7 +281,8 @@ def unwrap_json(payload):
         for key in CONTAINER_KEYS:
             inner = payload.get(key)
             if isinstance(inner, list):
-                api = key == "data" and ("totalRecords" in payload or "resultTruncated" in payload or "skipToken" in payload)
+                keys = set(norm_key(k) for k in payload)
+                api = key == "data" and bool(keys & {"totalrecords", "totalrecordscount", "resulttruncated", "skiptoken"})
                 label = "inventory API / pac resource-query" if api else "JSON object with '%s' array" % key
                 return [r for r in inner if isinstance(r, dict)], label, (page_meta(payload) if api else {})
             if isinstance(inner, dict) and isinstance(inner.get("rows"), list) and isinstance(inner.get("columns"), list):
@@ -544,7 +545,7 @@ def derive_harness(agent):
 
 def normalize_record(raw, source):
     flat = flatten(raw)
-    rec = {"_source": source, "_present": set()}
+    rec = {"_source": source, "_sources": {source}, "_present": set()}
     for field, aliases in FIELD_ALIASES.items():
         found, value = pick(flat, aliases)
         if found:
@@ -766,7 +767,7 @@ RULE_FIELDS = {
     "LC5": ["environmentType", "channels"],
     "LC6": ["capabilitiesCounts"],
     "LC7": ["lastPublishedAt"],
-    "OW1": ["ownerId"],
+    "OW1": ["ownerId", "accountState"],
     "OW2": ["present:ownerId"],
     "OW3": ["ownerId"],
     "RG1": ["location"],
@@ -803,12 +804,17 @@ class Audit:
         # Rule availability also needs the field in the file(s) the audited agents come from, so a scoped audit
         # of agents from a CSV is not enabled by fields that only another file carries. Optional JSON properties
         # that happen to be unset for every in-scope agent still count, because their file carries them.
+        everyone = coverage_agents if coverage_agents is not None else agents
+        self.source_coverage = {}
+        for source in sorted(set(s for a in everyone for s in a["_sources"])):
+            self.source_coverage[source] = self._coverage([a for a in everyone if source in a["_sources"]])
         if coverage_agents is not None:
-            sources = set(a.get("_source") for a in agents)
-            self.scope_coverage = self._coverage([a for a in coverage_agents if a.get("_source") in sources])
+            sources = set(s for a in agents for s in a["_sources"])
+            self.scope_coverage = self._coverage([a for a in coverage_agents if a["_sources"] & sources])
         else:
             self.scope_coverage = self.coverage
         self.gaps = []  # evidence gaps found while rules ran; reported as warnings
+        self.partial = OrderedDict()  # rule -> (agents skipped, {source: count}, fields) when only part of the scope carried the fields
         self.departing = set(x.strip().lower() for x in (opts.departing or "").split(",") if x.strip())
         self.allowed_regions = set(x.strip().lower() for x in (opts.allowed_regions or "").split(",") if x.strip())
         self.watch_connectors = [x.strip().lower() for x in (opts.watch_connectors or "").split(",") if x.strip()]
@@ -842,11 +848,45 @@ class Audit:
 
     def field_available(self, field):
         """The field exists in the audited agents' file(s) and the export populates it somewhere."""
+        if field == "accountState":
+            return self.account_state_available()
         if field == "environmentType":
             return any((a.get("_env") or {}).get("type") for a in self.agents)
         return self.field_present(field) and self.coverage.get(field, {}).get("populated", 0) > 0
 
+    def account_state_available(self):
+        return bool(self.departing) or any(u.get("enabled") is not None for u in self.users.values())
+
+    def agent_has_field(self, agent, field):
+        """The field exists in a file this agent's record came from (an unset optional property still counts)."""
+        if field in ("environmentType", "accountState"):
+            return True
+        return any(self.source_coverage.get(s, {}).get(field, {}).get("present", 0) > 0 for s in agent["_sources"])
+
+    def agent_field_available(self, agent, field):
+        """The field is populated somewhere in a file this agent's record came from."""
+        return any(self.source_coverage.get(s, {}).get(field, {}).get("populated", 0) > 0 for s in agent["_sources"])
+
+    def agent_measure_ok(self, agent, fields):
+        return all(self.agent_has_field(agent, f) and self.field_available(f) for f in fields)
+
+    def rule_fields(self, rule):
+        out = []
+        for req in RULE_FIELDS[rule]:
+            if req.startswith("any:"):
+                out.append(req[4:].split(","))
+            elif req.startswith("present:"):
+                out.append([req[8:]])
+            else:
+                out.append([req])
+        return out
+
+    def agent_eligible(self, agent, rule):
+        return all(any(self.agent_has_field(agent, f) for f in group) for group in self.rule_fields(rule))
+
     def field_reason(self, field):
+        if field == "accountState":
+            return "no owner account state supplied"
         if field == "environmentType":
             return "environment type not in export or join"
         if not self.field_present(field):
@@ -971,10 +1011,23 @@ class Audit:
         self.findings.append(finding)
 
     def run(self):
+        everyone = self.agents
         for rule in RULES:
             if not self.rule_available(rule):
                 continue
-            getattr(self, "rule_" + rule)()
+            eligible = [a for a in everyone if self.agent_eligible(a, rule)]
+            if len(eligible) < len(everyone):
+                skipped = [a for a in everyone if a not in eligible]
+                by_source = Counter(min(a["_sources"]) for a in skipped)
+                lacking = sorted(set(f for a in skipped for group in self.rule_fields(rule) for f in group if not any(self.agent_has_field(a, g) for g in group)))
+                self.partial[rule] = (len(skipped), by_source, lacking)
+            self.agents = eligible
+            try:
+                getattr(self, "rule_" + rule)()
+            finally:
+                self.agents = everyone
+            if rule in self.not_evaluated:
+                self.partial.pop(rule, None)  # the rule opted out entirely (for example RG1 without --allowed-regions)
         self.findings.sort(key=lambda f: (SEVERITY_ORDER[f["severity"]], f["rule"], (f.get("agentName") or "").lower(), f.get("agentId") or ""))
         for index, finding in enumerate(self.findings, 1):
             finding["id"] = "F%d" % index
@@ -987,13 +1040,13 @@ class Audit:
         return self.findings
 
     def rule_ID1(self):
-        agent_col = self.field_available("entraAgentId")
-        app_col = self.field_available("entraAppId")
         for a in self.agents:
             if a["isAgentBuilder"] or not self.is_published(a):
                 continue
             if a.get("entraAgentId") or a.get("entraAppId") or a.get("entraAgentBlueprintId"):
                 continue
+            agent_col = self.agent_field_available(a, "entraAgentId")
+            app_col = self.agent_field_available(a, "entraAppId")
             when = "published %s" % fmt_dt(a["lastPublishedAt"]) if a.get("lastPublishedAt") else "publish state not in export"
             note = " GitHub Copilot harness agents receive an identity at first publish." if a["harness"] == "GitHub Copilot" else ""
             missing = [n for n, ok in (("Entra Agent ID", agent_col), ("app registration", app_col)) if not ok]
@@ -1004,11 +1057,10 @@ class Audit:
                 self.add("ID1", "high", [a], "No Entra Agent ID or app registration recorded for %s. Without an identity there is nothing for Entra audit, Conditional Access, or Agent 365 to attach to. Confirm in Copilot Studio Settings > Advanced > Metadata and under Entra ID > Agents > Agent identities.%s" % (who, note))
 
     def rule_ID2(self):
-        agent_col = self.field_available("entraAgentId")
         for a in self.agents:
             if a["isAgentBuilder"] or not a.get("entraAppId") or a.get("entraAgentId"):
                 continue
-            if agent_col:
+            if self.agent_field_available(a, "entraAgentId"):
                 self.add("ID2", "medium", [a], "Identity is a legacy app registration (%s). Connector scopes and Conditional Access on the agent identity apply only to Entra Agent IDs; migrate in the Power Platform admin center (Actions > Recommendations) or with the migration API, or wait for Microsoft's automatic migration." % a["entraAppId"])
             else:
                 self.add("ID2", "medium", [a], "App registration %s is recorded and the export has no populated Entra Agent ID column, so this agent may be a legacy identity awaiting migration or may already be migrated. Confirm in Copilot Studio Settings > Advanced > Metadata before scheduling a migration." % a["entraAppId"])
@@ -1235,6 +1287,11 @@ class Audit:
             hit, why = self._departing(a.get("ownerId"))
             if hit:
                 self.add("OW1", "high", [a], "Owner %s is %s. When the account is removed the agent has no owner and any maker-provided connection it uses stops working." % (self.owner_label(a), why))
+        if self.users:
+            owners = set(a.get("ownerId") for a in self.agents if a.get("ownerId"))
+            unknown = [o for o in owners if o not in self.departing and (self.users.get(o) is None or self.users[o].get("enabled") is None)]
+            if unknown:
+                self.gaps.append("OW1: account state unknown for %d of %d owners (not in the user list, or the list has no account state for them); only owners listed as departing or marked disabled were flagged." % (len(unknown), len(owners)))
 
     def rule_OW2(self):
         none_populated = self.coverage.get("ownerId", {}).get("populated", 0) == 0
@@ -1385,22 +1442,32 @@ def build_environment_table(audit):
     for a in audit.agents:
         key = env_key(a)
         row = rows.setdefault(key, {"id": key, "name": audit.env_label(a), "type": audit.env_type(a) or "", "managed": (a.get("_env") or {}).get("isManaged", a.get("isManagedEnvironment")),
-                                    "agents": 0, "published": 0, "agentsWithFindings": 0, "high": 0, "medium": 0, "entireTenant": 0, "anonymous": 0, "quarantined": 0})
+                                    "agents": 0, "published": None, "publishStateUnknown": 0, "agentsWithFindings": 0, "high": 0, "medium": 0,
+                                    "entireTenant": None, "anonymous": None, "quarantined": None})
         row["agents"] += 1
-        if a.get("published") is True:
-            row["published"] += 1
+        # A measure stays None (n/a) until an agent in the environment carries the evidence for it.
+        if audit.agent_has_field(a, "lastPublishedAt"):
+            row["published"] = (row["published"] or 0) + (1 if a.get("published") is True else 0)
+            if a.get("published") is None:
+                row["publishStateUnknown"] += 1
         if a["_findings"]:
             row["agentsWithFindings"] += 1
         counts = sev_counts(a["_findings"])
         row["high"] += counts["high"]
         row["medium"] += counts["medium"]
-        if audit.entire_tenant(a):
-            row["entireTenant"] += 1
-        if audit.anonymous(a) and a["channels"] and audit.is_published(a):
-            row["anonymous"] += 1
-        if a.get("isQuarantined") is True:
-            row["quarantined"] += 1
+        if audit.agent_measure_ok(a, ("sharedWithViewers",)):
+            row["entireTenant"] = (row["entireTenant"] or 0) + (1 if audit.entire_tenant(a) else 0)
+        if audit.agent_measure_ok(a, ("authentication", "channels")):
+            row["anonymous"] = (row["anonymous"] or 0) + (1 if audit.anonymous(a) and a["channels"] and audit.is_published(a) else 0)
+        if audit.agent_measure_ok(a, ("isQuarantined",)):
+            row["quarantined"] = (row["quarantined"] or 0) + (1 if a.get("isQuarantined") is True else 0)
     return sorted(rows.values(), key=lambda r: (-r["high"], -r["medium"], -r["agents"], r["name"].lower()))
+
+
+def env_cell(value, unknown=0):
+    if value is None:
+        return "n/a"
+    return "%d (+%d unknown)" % (value, unknown) if unknown else value
 
 
 def build_connector_table(audit):
@@ -1634,6 +1701,15 @@ def truncated_note(rows, shown, what):
     return ["", "… and %d more %s (see JSON or raise --max-rows)." % (extra, what if extra != 1 else what[:-1])]
 
 
+def partial_text(audit):
+    """Rules that ran only on the agents whose source file carries their fields."""
+    parts = []
+    for rule, (count, by_source, lacking) in audit.partial.items():
+        where = ", ".join("%d from %s" % (n, s) for s, n in by_source.most_common())
+        parts.append("%s skipped %s (%s; %s not in that file)" % (rule, plural(count, "agent"), where, ", ".join(lacking)))
+    return "; ".join(parts)
+
+
 def not_evaluated_text(audit):
     """Group skipped rules by cause and say what would enable them."""
     if not audit.not_evaluated:
@@ -1658,6 +1734,9 @@ def not_evaluated_text(audit):
             label = rule
         elif "identity column" in reason:
             key = ("no identity column populated", "use an export that carries identity fields")
+            label = rule
+        elif "account state" in reason:
+            key = ("no owner account state supplied", "pass --users with an account-enabled or status column, or --departing")
             label = rule
         else:
             key = ("field not in export", "use an API or Azure Resource Graph export")
@@ -1704,6 +1783,8 @@ def render_header(ctx, brief=False):
             coverage += "; present but empty: " + ", ".join(empty)
         rows.append(("Field coverage", coverage))
     rows.append(("Rules not evaluated", not_evaluated_text(audit)))
+    if audit.partial:
+        rows.append(("Rules evaluated on part of the scope", partial_text(audit)))
     if not brief:
         rows.append(("Not visible to this audit", "instructions, knowledge content, usage, data policy evaluation results, Conditional Access state, Entra sponsors, Copilot Credits, agent evaluation results"))
     rows.append(("Tool", "agent_inventory_audit.py %s" % TOOL_VERSION))
@@ -1884,10 +1965,10 @@ def render_environments(ctx):
         lines.append("_No environment information in the export._")
         lines.append("")
         return lines
-    lines.append("Finding counts are per agent; a shared-connection finding counts once for each agent it names.")
+    lines.append("Finding counts are per agent; a shared-connection finding counts once for each agent it names. n/a means no agent in that environment carries the evidence for the measure.")
     lines.append("")
     lines.append(table(["Environment", "Type", "Managed Environment", "Agents", "Published", "With findings", "High", "Medium", "Shared with entire tenant", "No user auth"],
-                       [(r["name"], r["type"] or "n/a", yes_no(r["managed"]), r["agents"], r["published"], r["agentsWithFindings"], r["high"], r["medium"], r["entireTenant"], r["anonymous"]) for r in rows[:max_rows]]))
+                       [(r["name"], r["type"] or "n/a", yes_no(r["managed"]), r["agents"], env_cell(r["published"], r["publishStateUnknown"]), r["agentsWithFindings"], r["high"], r["medium"], env_cell(r["entireTenant"]), env_cell(r["anonymous"])) for r in rows[:max_rows]]))
     lines += truncated_note(rows, max_rows, "environments")
     lines.append("")
     return lines
@@ -2021,6 +2102,9 @@ def render_dossier(ctx, agent):
     header = "Source: %s. Reference date %s (not the export time). Tool %s." % ("; ".join(os.path.basename(p) for p, _, _ in ctx["sources"]), fmt_dt(opts.as_of_dt), TOOL_VERSION)
     if audit.not_evaluated:
         header += " Not evaluated: %s." % not_evaluated_text(audit)
+    skipped_for = [rule for rule in audit.partial if rule not in audit.not_evaluated and not audit.agent_eligible(agent, rule)]
+    if skipped_for:
+        header += " Not evaluated for this agent because its source file lacks the fields: %s." % ", ".join(skipped_for)
     if ctx["exportComplete"] is False:
         header += " EXPORT INCOMPLETE: a page was truncated, so shared-connection dependents and owner counts may be missing."
     lines.append(header)
@@ -2138,6 +2222,8 @@ def render_handover(ctx, owner_key):
         owner_key, (", " + state) if state else "", "; ".join(os.path.basename(p) for p, _, _ in ctx["sources"]), fmt_dt(opts.as_of_dt), TOOL_VERSION)
     if audit.not_evaluated:
         header += " Not evaluated: %s." % not_evaluated_text(audit)
+    if audit.partial:
+        header += " Rules evaluated on part of the scope: %s." % partial_text(audit)
     if ctx["exportComplete"] is False:
         header += " EXPORT INCOMPLETE: a page was truncated, so agents this owner holds and the agents that depend on their connections may be missing from this list."
     lines.append(header)
@@ -2327,6 +2413,7 @@ def build_json(ctx):
         ("scope", {"environmentFilter": ctx["opts"].environment, "agentFilter": ctx["opts"].agent, "ownerFilter": ctx["opts"].owner, "excluded": ctx["excluded"]}),
         ("warnings", ctx["warnings"]),
         ("exportComplete", ctx["exportComplete"]),
+        ("partiallyEvaluated", OrderedDict((r, {"agentsSkipped": c, "bySource": dict(b), "fieldsMissing": l}) for r, (c, b, l) in audit.partial.items())),
         ("fieldCoverage", audit.coverage),
         ("fieldsAbsent", audit.fields_absent()),
         ("fieldsPresentButEmpty", audit.fields_empty()),
@@ -2448,6 +2535,8 @@ def main(argv=None):
     other_types = Counter()
 
     pages = []  # (file, records, meta) for API-shaped files, to judge completeness across pages
+    page_keys = set()  # distinct resource IDs supplied by page files, so a page passed twice does not count twice
+    page_nokey = 0
     for path in opts.inventory:
         if not os.path.isfile(path):
             parser.error("not a file: %s" % path)
@@ -2460,6 +2549,11 @@ def main(argv=None):
             continue
         for raw in records:
             rec = normalize_record(raw, os.path.basename(path))
+            if meta:
+                if rec.get("id"):
+                    page_keys.add(rec["id"].lower())
+                else:
+                    page_nokey += 1
             if looks_like_environment(rec):
                 env = environment_from_record(raw)
                 if env:
@@ -2473,20 +2567,20 @@ def main(argv=None):
 
     export_complete = None  # None: no pagination evidence; True/False otherwise
     if pages:
-        supplied = sum(n for _, n, _ in pages)
+        supplied = len(page_keys) + page_nokey  # distinct resources, not raw rows
         totals = [m["totalRecords"] for _, _, m in pages if m.get("totalRecords") is not None]
         expected = max(totals) if totals else None
-        truncated = [name for name, _, m in pages if m.get("truncated")]
+        truncated = dedupe([name for name, _, m in pages if m.get("truncated")])
         if expected is not None and supplied >= expected:
             export_complete = True
         elif truncated:
             export_complete = False
-            missing = " %d of %d records supplied;" % (supplied, expected) if expected is not None else ""
+            missing = " %d of %d distinct records supplied;" % (supplied, expected) if expected is not None else ""
             warnings.append("Export incomplete: %s %s a truncated page (resultTruncated or skipToken set).%s request the remaining pages with skipToken and pass all page files together before drawing tenant-wide conclusions. Ownership counts, shared-connection dependencies, and owner handovers cover only the records supplied." % (
                 ", ".join(truncated), "is" if len(truncated) == 1 else "are", missing))
         elif expected is not None and supplied < expected:
             export_complete = False
-            warnings.append("Export incomplete: %d of %d records supplied (totalRecords in the page header). Request the remaining pages and pass all page files together before drawing tenant-wide conclusions." % (supplied, expected))
+            warnings.append("Export incomplete: %d of %d distinct records supplied (totalRecords in the page header). Request the remaining pages and pass all page files together before drawing tenant-wide conclusions." % (supplied, expected))
         else:
             export_complete = True
 
@@ -2514,6 +2608,7 @@ def main(argv=None):
                         if field == "lastPublishedAt":
                             first["_rawLastPublished"] = rec.get("_rawLastPublished")
                     first["_present"].add(field)
+            first["_sources"] |= rec["_sources"]
             if (rec["_connectorDetail"] and not first["_connectorDetail"]) or (rec["powerPlatformConnectors"] and not first["powerPlatformConnectors"]):
                 first["powerPlatformConnectors"] = rec["powerPlatformConnectors"]
                 first["_connectorDetail"] = first["_connectorDetail"] or rec["_connectorDetail"]

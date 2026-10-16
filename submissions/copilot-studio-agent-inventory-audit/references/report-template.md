@@ -13,6 +13,7 @@ The script's Markdown report is the raw audit; the shapes below are what you bui
 | Sources | agents.json (inventory API / pac resource-query, 312 records) |
 | Agents audited | 287 of 300 agent records (13 outside the requested scope) |
 | Export completeness | INCOMPLETE: … (only when an API page was truncated) |
+| Rules evaluated on part of the scope | EX2 skipped 12 agents (12 from admin.csv; sharedWithViewers not in that file) (only when files from different routes are combined) |
 | Reference date (--as-of) | 2026-10-16 (used for age calculations; not the export time) |
 | Environment records in export | 12 |
 | Environments joined | 287 of 287 environment IDs resolved to a name |
