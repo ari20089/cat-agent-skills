@@ -595,8 +595,19 @@ def normalize_record(raw, source):
     return rec
 
 
+def agent_key(rec):
+    """Identity used for de-duplication and cross-references. A bot keeps its ID when a solution is deployed
+    to another environment, so the key is the ID qualified by the environment when it is known. (Tenant is not
+    part of the key: environment IDs are already tenant-unique, and CSV exports omit the tenant.)"""
+    if not rec.get("id"):
+        return None
+    return "%s|%s" % ((rec.get("environmentId") or "").lower(), rec["id"].lower())
+
+
 def finalize(rec):
     """Recompute derived fields; called after normalization and after merging duplicates."""
+    if rec.get("_harnessDerived"):
+        rec["harness"] = None  # an inferred harness is not evidence; re-derive from the merged record
     rec["harness"], rec["_harnessDerived"] = derive_harness(rec)
     rec["isAgentBuilder"] = bool(rec.get("createdIn") and "agent builder" in rec["createdIn"].lower()) or rec["harness"] == "Copilot Chat"
     rec["_unparsedPublishDate"] = False
@@ -678,6 +689,7 @@ DEPARTED_WORDS = ("disabled", "departed", "left", "terminated", "inactive", "off
 def load_users(path):
     records, _, _ = load_file(path)
     users = {}
+    by_name = {}
     for raw in records:
         flat = flatten(raw)
         uid = None
@@ -711,8 +723,12 @@ def load_users(path):
             users[uid] = entry
         if upn:
             users.setdefault(upn, entry)
-        if name and not uid and not upn:
-            users.setdefault(name.lower(), entry)
+        if name:
+            by_name.setdefault(name.lower(), []).append(entry)
+    # Admin center CSVs carry owners as display names; index a name only when it maps to exactly one user.
+    for name, entries in by_name.items():
+        if len(entries) == 1:
+            users.setdefault(name, entries[0])
     return users
 
 
@@ -793,7 +809,7 @@ def custom_connector(connector_id):
 class Audit:
     def __init__(self, agents, environments, users, opts, coverage_agents=None):
         self.agents = agents
-        self.by_id = {a.get("id"): a for a in agents if a.get("id")}
+        self.by_id = {agent_key(a): a for a in agents if agent_key(a)}
         self.environments = environments
         self.users = users
         self.opts = opts
@@ -1018,7 +1034,7 @@ class Audit:
             eligible = [a for a in everyone if self.agent_eligible(a, rule)]
             if len(eligible) < len(everyone):
                 skipped = [a for a in everyone if a not in eligible]
-                by_source = Counter(min(a["_sources"]) for a in skipped)
+                by_source = Counter(os.path.basename(min(a["_sources"])) for a in skipped)
                 lacking = sorted(set(f for a in skipped for group in self.rule_fields(rule) for f in group if not any(self.agent_has_field(a, g) for g in group)))
                 self.partial[rule] = (len(skipped), by_source, lacking)
             self.agents = eligible
@@ -1193,7 +1209,7 @@ class Audit:
             for cid, op in self._ops(a):
                 conn = op.get("connectionIdSharedByMaker")
                 if conn and not is_blank(conn):
-                    by_connection.setdefault(str(conn), OrderedDict()).setdefault(a.get("id") or id(a), (a, set()))[1].add(cid)
+                    by_connection.setdefault(str(conn), OrderedDict()).setdefault(agent_key(a) or id(a), (a, set()))[1].add(cid)
         return by_connection
 
     def rule_CR3(self):
@@ -2449,6 +2465,8 @@ def match_agent(agents, needle):
     if len(exact) == 1:
         return exact[0], None
     if len(exact) > 1:
+        if len(set((a.get("id") or "").lower() for a in exact)) == 1:
+            return None, "Agent ID %s exists in %d environments (%s); add --environment to pick one." % (exact[0].get("id"), len(exact), ", ".join(dedupe([(a.get("_env") or {}).get("name") or a.get("environmentId") or "?" for a in exact])))
         return None, "%d agents match '%s' exactly (%s); use the agent ID." % (len(exact), needle, "; ".join(a.get("id") or "?" for a in exact[:10]))
     partial = [a for a in agents if low in (a.get("displayName") or "").lower()]
     if len(partial) == 1:
@@ -2534,26 +2552,25 @@ def main(argv=None):
     env_records = 0
     other_types = Counter()
 
-    pages = []  # (file, records, meta) for API-shaped files, to judge completeness across pages
-    page_keys = set()  # distinct resource IDs supplied by page files, so a page passed twice does not count twice
-    page_nokey = 0
+    page_files = OrderedDict()  # absolute path -> {"keys", "nokey", "meta"} for API-shaped files, to judge completeness
     for path in opts.inventory:
         if not os.path.isfile(path):
             parser.error("not a file: %s" % path)
         records, shape, meta = load_file(path)
         sources.append((path, shape, len(records)))
+        source_id = os.path.abspath(path)  # full path, so inventory.csv in two folders are two sources
         if meta:
-            pages.append((os.path.basename(path), len(records), meta))
+            page_files[source_id] = {"keys": set(), "nokey": 0, "meta": meta}
         if not records:
             warnings.append("%s: no records recognized (%s)." % (os.path.basename(path), shape))
             continue
         for raw in records:
-            rec = normalize_record(raw, os.path.basename(path))
+            rec = normalize_record(raw, source_id)
             if meta:
-                if rec.get("id"):
-                    page_keys.add(rec["id"].lower())
+                if agent_key(rec):
+                    page_files[source_id]["keys"].add(agent_key(rec))
                 else:
-                    page_nokey += 1
+                    page_files[source_id]["nokey"] += 1
             if looks_like_environment(rec):
                 env = environment_from_record(raw)
                 if env:
@@ -2566,23 +2583,32 @@ def main(argv=None):
                 other_types[rec["type"]] += 1
 
     export_complete = None  # None: no pagination evidence; True/False otherwise
-    if pages:
-        supplied = len(page_keys) + page_nokey  # distinct resources, not raw rows
-        totals = [m["totalRecords"] for _, _, m in pages if m.get("totalRecords") is not None]
-        expected = max(totals) if totals else None
-        truncated = dedupe([name for name, _, m in pages if m.get("truncated")])
-        if expected is not None and supplied >= expected:
-            export_complete = True
-        elif truncated:
-            export_complete = False
-            missing = " %d of %d distinct records supplied;" % (supplied, expected) if expected is not None else ""
-            warnings.append("Export incomplete: %s %s a truncated page (resultTruncated or skipToken set).%s request the remaining pages with skipToken and pass all page files together before drawing tenant-wide conclusions. Ownership counts, shared-connection dependencies, and owner handovers cover only the records supplied." % (
-                ", ".join(truncated), "is" if len(truncated) == 1 else "are", missing))
-        elif expected is not None and supplied < expected:
-            export_complete = False
-            warnings.append("Export incomplete: %d of %d distinct records supplied (totalRecords in the page header). Request the remaining pages and pass all page files together before drawing tenant-wide conclusions." % (supplied, expected))
-        else:
-            export_complete = True
+    if page_files:
+        # Pages of one query share its totalRecords, so completeness is judged per total: distinct resources
+        # supplied by that group of files against that total. Records from another query cannot fill the gap.
+        groups = OrderedDict()
+        for source_id, info in page_files.items():
+            total = info["meta"].get("totalRecords")
+            group = groups.setdefault(total, {"keys": set(), "nokey": 0, "files": [], "truncated": []})
+            group["keys"] |= info["keys"]
+            group["nokey"] += info["nokey"]
+            group["files"].append(os.path.basename(source_id))
+            if info["meta"].get("truncated"):
+                group["truncated"].append(os.path.basename(source_id))
+        problems = []
+        for total, group in groups.items():
+            supplied = len(group["keys"]) + group["nokey"]
+            if total is not None and supplied >= total:
+                continue
+            if group["truncated"]:
+                problems.append("%s %s a truncated page (resultTruncated or skipToken set)%s" % (
+                    ", ".join(group["truncated"]), "is" if len(group["truncated"]) == 1 else "are",
+                    " with %d of %d distinct records supplied" % (supplied, total) if total is not None else ""))
+            elif total is not None:
+                problems.append("%s supplied %d of %d distinct records (totalRecords in the page header)" % (", ".join(group["files"]), supplied, total))
+        export_complete = not problems
+        if problems:
+            warnings.append("Export incomplete: %s. Request the remaining pages with skipToken and pass all page files together before drawing tenant-wide conclusions. Ownership counts, shared-connection dependencies, and owner handovers cover only the records supplied." % "; ".join(problems))
 
     if opts.environments:
         records, _, _ = load_file(opts.environments)
@@ -2593,12 +2619,33 @@ def main(argv=None):
 
     users = load_users(opts.users) if opts.users else {}
 
+    # Resolve environment names to IDs before de-duplication, so an admin center CSV row (environment by name)
+    # and an API record (environment by ID) for the same agent share a key.
+    name_to_id = {}
+    for eid, env in env_map.items():
+        if env.get("name"):
+            name_to_id.setdefault(env["name"].lower(), set()).add(eid)
+    for rec in raw_agents:
+        if not rec.get("environmentId") and rec.get("environmentName"):
+            ids = name_to_id.get(rec["environmentName"].lower())
+            if ids and len(ids) == 1:
+                rec["environmentId"] = next(iter(ids))
+                rec["_present"].add("environmentId")
+
     agents = []
     seen = {}
+    by_bare_id = {}  # bare agent ID -> kept records, for records whose environment is unknown
     for rec in raw_agents:
-        key = (rec.get("id") or "").lower()
-        if key and key in seen:
-            first = seen[key]
+        key = agent_key(rec)
+        first = seen.get(key) if key else None
+        if first is None and rec.get("id"):
+            # A record with no environment (or a candidate with none) merges into the only record with that ID.
+            candidates = by_bare_id.get(rec["id"].lower(), [])
+            if len(candidates) == 1 and (not rec.get("environmentId") or not candidates[0].get("environmentId")):
+                first = candidates[0]
+        if first is not None:
+            if first.get("_harnessDerived"):
+                first["harness"] = None  # let an explicit harness from the second record win over an inferred one
             for field in FIELD_ALIASES:
                 if field not in rec["_present"] or field == "powerPlatformConnectors":
                     continue
@@ -2615,12 +2662,18 @@ def main(argv=None):
                 if first["_connectorDetail"]:
                     first["_present"].add("connectorOperations")
             finalize(first)
+            seen[agent_key(first)] = first  # the merge may have supplied the environment; key it under the new identity too
             continue
         if key:
             seen[key] = rec
+            by_bare_id.setdefault(rec["id"].lower(), []).append(rec)
         agents.append(rec)
     if len(raw_agents) != len(agents):
-        warnings.append("%d duplicate agent records merged by ID." % (len(raw_agents) - len(agents)))
+        warnings.append("%d duplicate agent records merged by ID within the same environment." % (len(raw_agents) - len(agents)))
+    same_id = Counter((a.get("id") or "").lower() for a in agents if a.get("id"))
+    cross_env = sum(1 for n in same_id.values() if n > 1)
+    if cross_env:
+        warnings.append("%s in more than one environment (the same bot deployed through a solution); each deployment is audited separately. Use --environment with --agent to pick one." % plural(cross_env, "agent ID appears", "agent IDs appear"))
     no_id = sum(1 for a in agents if not a.get("id"))
     if no_id:
         warnings.append("%d agent records have no ID column; findings for them cannot be cross-referenced." % no_id)
