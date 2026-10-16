@@ -245,13 +245,16 @@ def component_key(el):
     return el.tag
 
 
-def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bool = True):
+def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bool = True, repeated: bool = False):
     """Flatten an element into {path: value} for leaf comparison.
 
     Path rules, chosen so that a path never changes because a sibling appeared or disappeared:
     - keyed elements (see child_key) contribute `tag[key]`; identical keys among siblings get `#n`;
-    - unkeyed elements with children are transparent wrappers: they add no segment, their children
-      attach to the parent path, and their own attributes are recorded as `tag/@attr`;
+    - unkeyed elements with children and no attributes of their own are transparent wrappers when they
+      are the only child of their tag: they add no segment and their children attach to the parent path;
+    - unkeyed elements that carry attributes (FetchXML `filter type="or"`, `forms type="main"`) or that
+      repeat among siblings become positional segments (`filter`, `filter#2`) so nested and sibling
+      groups keep their own attributes and children;
     - keyed leaf elements always record a presence leaf, so `<attribute name="x"/>` registers;
       unkeyed empty wrappers such as `<CustomActions/>` record nothing.
     """
@@ -264,7 +267,8 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
     key = child_key(el)
     keyed = key != el.tag
     has_children = len(el) > 0
-    if keyed or root or not has_children:
+    own_attrs = any(noise or a not in NOISE_TAGS for a in el.attrib)
+    if keyed or root or not has_children or repeated or own_attrs:
         counters[(prefix, key)] += 1
         n = counters[(prefix, key)]
         if n > 1:
@@ -289,8 +293,11 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
     if not has_children and (t or (keyed and not wrote)):
         out[path] = t
     sub = defaultdict(int) if child_prefix == path else counters
+    tags = defaultdict(int)
     for c in el:
-        flatten(c, noise, child_prefix, out, sub, False)
+        tags[c.tag] += 1
+    for c in el:
+        flatten(c, noise, child_prefix, out, sub, False, tags[c.tag] > 1)
     return out
 
 
@@ -505,9 +512,12 @@ def flow_actions(node, prefix="", out=None):
             continue
         path = f"{prefix}/{name}" if prefix else name
         clean = {k: v for k, v in body.items() if k not in ("metadata", "runAfter", "actions", "else", "cases", "default")}
+        if isinstance(body.get("cases"), dict):
+            clean["cases"] = {cn: (c.get("case") if isinstance(c, dict) else c) for cn, c in body["cases"].items()}
         canon = re.sub(r"(shared_[a-z0-9]+)-[0-9a-f]{5,}", r"\1", json.dumps(clean, sort_keys=True, default=str))
         out[path] = {"type": body.get("type", ""), "hash": hashlib.sha256(canon.encode()).hexdigest()[:12],
-            "runAfter": sorted((body.get("runAfter") or {}).keys()), "leaves": json_leaves(clean),
+            "runAfter": {k: (sorted(str(x) for x in v) if isinstance(v, list) else [str(v)]) for k, v in (body.get("runAfter") or {}).items()},
+            "leaves": json_leaves(clean),
             "connection": ((body.get("inputs") or {}).get("host") or {}).get("connectionName", "") if isinstance(body.get("inputs"), dict) else ""}
         flow_actions(body.get("actions"), path, out)
         if isinstance(body.get("else"), dict):
@@ -552,6 +562,14 @@ def leaf_diff_lines(old, new, limit=8):
     return lines[:limit] + ([f"… {more} more"] if more > 0 else [])
 
 
+def _strip_meta(node):
+    if isinstance(node, dict):
+        return {k: _strip_meta(v) for k, v in node.items() if k != "metadata"}
+    if isinstance(node, list):
+        return [_strip_meta(v) for v in node]
+    return node
+
+
 def flow_summary(pkg: Package, json_name: str):
     data = pkg.get(json_name) if json_name else None
     if data is None:
@@ -572,8 +590,10 @@ def flow_summary(pkg: Package, json_name: str):
             conns[k] = {"api": (v.get("api") or {}).get("name", ""),
                         "reference": (v.get("connection") or {}).get("connectionReferenceLogicalName", ""),
                         "runtimeSource": v.get("runtimeSource", "")}
+    canon = re.sub(r"(shared_[a-z0-9]+)-[0-9a-f]{5,}", r"\1", json.dumps(_strip_meta(definition), sort_keys=True, default=str))
     return {"triggers": triggers, "actions": flow_actions(definition.get("actions")),
-            "connections": conns, "parameters": sorted((definition.get("parameters") or {}).keys())}
+            "connections": conns, "parameters": json_leaves(_strip_meta(definition.get("parameters") or {})),
+            "def_hash": hashlib.sha256(canon.encode()).hexdigest()[:12]}
 
 
 def extract_workflows(root, pkg, noise, components):
@@ -639,6 +659,30 @@ def extract_simple(root, path, ctype, key_attr, components, noise, label_fn=None
         label = label_fn(el) if label_fn else key
         add(components, Component(ctype, key.strip("{}").lower() if key_attr.lower().endswith("id") else key,
                                   label, flatten(el, noise), _extra_for(ctype, el)))
+
+
+def extract_customapi_params(root, noise, components):
+    """Request parameters and response properties are scoped to their custom API, and names repeat across
+    APIs and across the two kinds, so the identity is owning API + kind + unique name."""
+    owners = {}
+    for api in root.findall("customapis/customapi"):
+        aid = (api.attrib.get("customapiid") or text(api, "customapiid")).strip("{}").lower()
+        if aid:
+            owners[aid] = text(api, "uniquename") or aid
+    for path, ctype, kind in (("customapirequestparameters/customapirequestparameter", "Custom API request parameters", "request parameter"),
+                              ("customapiresponseproperties/customapiresponseproperty", "Custom API response properties", "response property")):
+        for el in root.findall(path):
+            pname = text(el, "uniquename") or text(el, "name") or component_key(el)
+            owner = ""
+            for c in el:
+                if c.tag.lower() == "customapiid":
+                    guid = (c.text or "").strip().strip("{}").lower()
+                    owner = (c.attrib.get("uniquename") or c.attrib.get("name") or c.attrib.get("schemaname")
+                             or owners.get(guid, guid))
+                    break
+            key = f"{owner}/{pname}" if owner else pname
+            label = f"{pname} ({kind} of {owner})" if owner else f"{pname} ({kind})"
+            add(components, Component(ctype, key, label, flatten(el, noise), _extra_for(ctype, el)))
 
 
 def extract_webresources(root, pkg, noise, components):
@@ -998,8 +1042,6 @@ SIMPLE = [
     ("connectionreferences/connectionreference", "Connection references", "connectionreferencelogicalname"),
     ("CustomControls/CustomControl", "Custom controls (PCF)", "Name"),
     ("customapis/customapi", "Custom APIs", "uniquename"),
-    ("customapirequestparameters/customapirequestparameter", "Custom API parameters", "uniquename"),
-    ("customapiresponseproperties/customapiresponseproperty", "Custom API parameters", "uniquename"),
     ("bots/bot", "Copilot Studio agents", "schemaname"),
     ("botcomponents/botcomponent", "Copilot Studio agent components", "schemaname"),
     ("EntityMaps/EntityMap", "Entity maps", "EntityMapId"),
@@ -1018,6 +1060,7 @@ def extract_all(pkg: Package, noise: bool):
     extract_roles(root, noise, components)
     extract_webresources(root, pkg, noise, components)
     extract_canvas(root, pkg, noise, components)
+    extract_customapi_params(root, noise, components)
     extract_envvars(root, pkg, noise, components)
     for path, ctype, key in SIMPLE:
         label_fn = None
@@ -1351,7 +1394,13 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
             detail.append(f"action changed: {a} ({oa[a]['type']}" + (f" -> {na[a]['type']}" if oa[a]['type'] != na[a]['type'] else "") + ")")
             detail.extend(f"  {d}" for d in leaf_diff_lines(oa[a].get("leaves", {}), na[a].get("leaves", {}), 6))
         elif oa[a]["runAfter"] != na[a]["runAfter"]:
-            detail.append(f"action re-ordered: {a}")
+            ora, nra = oa[a]["runAfter"], na[a]["runAfter"]
+            if isinstance(ora, dict) and isinstance(nra, dict) and sorted(ora) == sorted(nra):
+                conds = [f"{p}: {'/'.join(ora[p])} -> {'/'.join(nra[p])}" for p in sorted(ora) if ora[p] != nra[p]]
+                detail.append(f"action run condition changed: {a} ({'; '.join(conds)})")
+                flag(flags, "medium", "Cloud flows", key, f"action '{a.rsplit('/', 1)[-1]}' now runs on a different outcome of its predecessor ({'; '.join(conds[:2])})")
+            else:
+                detail.append(f"action re-ordered: {a} (after {', '.join(sorted(ora)) or 'start'} -> after {', '.join(sorted(nra)) or 'start'})")
     moved_to = set(moved.values())
     for a in na:
         if a not in oa and a not in moved_to:
@@ -1379,6 +1428,22 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
     for c in old["connections"]:
         if c not in new["connections"]:
             detail.append(f"connection removed: {c}")
+    op, npar = old.get("parameters") or {}, new.get("parameters") or {}
+    if isinstance(op, dict) and isinstance(npar, dict):
+        for p in op:
+            if p not in npar:
+                detail.append(f"parameter removed: {p}")
+            elif op[p] != npar[p]:
+                detail.append(f"parameter changed: {p} ({op[p]!r} -> {npar[p]!r})")
+        for p in npar:
+            if p not in op:
+                detail.append(f"parameter added: {p} = {npar[p]!r}")
+        pchanged = [d for d in detail if d.startswith("parameter ")]
+        if pchanged:
+            flag(flags, "medium", "Cloud flows", key, f"{len(pchanged)} flow definition parameter(s) changed; defaults and dependent values change behavior")
+    if not detail and old.get("def_hash") and new.get("def_hash") and old["def_hash"] != new["def_hash"]:
+        detail.append("flow definition changed in parts not itemized above (normalized definition digest differs); review the definition JSON")
+        flag(flags, "medium", "Cloud flows", key, "definition changed in parts the comparison does not itemize; review the flow JSON and run the flow end to end")
     return detail
 
 
@@ -1398,7 +1463,8 @@ REMOVED_MESSAGES = {
     "Plug-in steps": "plug-in step removed; the validation or side effect it performed silently stops",
     "Cloud flows": "flow removed; automation it performed stops",
     "Custom APIs": "custom API removed; callers and integrations fail",
-    "Custom API parameters": "custom API parameter removed; existing callers break",
+    "Custom API request parameters": "custom API request parameter removed; existing callers break",
+    "Custom API response properties": "custom API response property removed; callers reading it break",
     "Web resources": "web resource removed; forms and commands that load it break",
     "Model-driven apps": "app removed; users lose the navigation surface",
 }
@@ -1414,7 +1480,7 @@ def assess(ctype, comp_old, comp_new, status, changes, flags, removed_parents=fr
     if status == "removed":
         sev = "high" if ctype in {"Tables", "Columns", "Relationships", "Choices (global)", "Security roles",
                                   "Connection references", "Environment variables", "Plug-in steps", "Cloud flows",
-                                  "Custom APIs", "Custom API parameters", "Forms", "Views", "Model-driven apps", "Web resources",
+                                  "Custom APIs", "Custom API request parameters", "Custom API response properties", "Forms", "Views", "Model-driven apps", "Web resources",
                                   "Business rules", "Business process flows", "Classic workflows", "Custom actions",
                                   "Plug-in assemblies", "Plug-in packages", "Custom connectors"} else "medium"
         flag(flags, sev, ctype, label, REMOVED_MESSAGES.get(ctype, "removed; dependent components and integrations may break"), kind="removed")
@@ -1622,7 +1688,7 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
                  "Dashboards", "Sitemaps", "Model-driven apps", "Canvas apps", "Custom controls (PCF)", "Web resources",
                  "Security roles", "Field security profiles", "Business rules", "Business process flows",
                  "Classic workflows", "Custom actions", "Dialogs", "Cloud flows", "Desktop flows", "AI flows", "Processes",
-                 "Custom APIs", "Custom API parameters", "Plug-in packages", "Plug-in assemblies", "Plug-in steps",
+                 "Custom APIs", "Custom API request parameters", "Custom API response properties", "Plug-in packages", "Plug-in assemblies", "Plug-in steps",
                  "Custom connectors", "Connection references", "Environment variables", "Reports",
                  "Copilot Studio agents", "Copilot Studio agent components", "Email templates", "Mail merge templates",
                  "Article templates", "Contract templates", "Entity maps"]
@@ -1694,6 +1760,13 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
                         bucket["unchanged_names"].append(n.label)
         results[t] = bucket
     notes = cross_reference(results, bc, cc, flags)
+    brc, crc = bm.get("root_components", {}), cm.get("root_components", {})
+    behavior_names = {"0": "include subcomponents", "1": "do not include subcomponents", "2": "shell only"}
+    rc_behavior = []
+    for k in sorted(set(brc) & set(crc)):
+        if brc[k] != crc[k]:
+            rc_behavior.append(f"{k}: behavior {brc[k]} ({behavior_names.get(brc[k], '?')}) -> {crc[k]} ({behavior_names.get(crc[k], '?')})")
+            flag(flags, "medium", "Solution manifest", k, f"root component behavior changed {brc[k]} -> {crc[k]} ({behavior_names.get(brc[k], '?')} -> {behavior_names.get(crc[k], '?')}); the set of subcomponents the solution ships changes")
     focus = None
     if only_types:
         available = list(results.keys())
@@ -1713,7 +1786,7 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
                             + ". Types present: " + ", ".join(available) + ".")
         focus = [t for t in available if t in wanted]
         results = OrderedDict((t, b) for t, b in results.items() if t in wanted)
-        flags = [f for f in flags if f["type"] in wanted or f["type"] == "Dependencies"]
+        flags = [f for f in flags if f["type"] in wanted or f["type"] in ("Dependencies", "Solution manifest")]
         if focus:
             warnings.append("Focused comparison: only " + ", ".join(focus) + " are reported. Other component types may also have changed; rerun without --types for the full picture.")
     sev_order = {"high": 0, "medium": 1, "low": 2}
@@ -1728,6 +1801,7 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
          "root_component_changes": {
              "added": sorted(set(cm.get("root_components", {})) - set(bm.get("root_components", {}))),
              "removed": sorted(set(bm.get("root_components", {})) - set(cm.get("root_components", {}))),
+             "behavior_changed": rc_behavior,
          }}
     r["deployment_inputs"] = deployment_inputs(r)
     return r
@@ -1822,12 +1896,14 @@ def render_markdown(r, limit: int, brief: bool = False) -> str:
         out.append(f"| {t} | {a} | {rm} | {m} | {u} |")
     out.append(f"| **Total** | **{ta}** | **{tr}** | **{tm}** | **{tu}** |")
     rc = r.get("root_component_changes", {})
-    if rc.get("added") or rc.get("removed"):
+    if rc.get("added") or rc.get("removed") or rc.get("behavior_changed"):
         out.append("")
         if rc.get("added"):
             out.append("Root components added in solution.xml: " + "; ".join(rc["added"]))
         if rc.get("removed"):
             out.append("Root components removed from solution.xml: " + "; ".join(rc["removed"]))
+        if rc.get("behavior_changed"):
+            out.append("Root component behavior changed in solution.xml: " + "; ".join(rc["behavior_changed"]))
     out.append("")
     out.append("## Attention items")
     out.append("")
@@ -1908,8 +1984,8 @@ def render_markdown(r, limit: int, brief: bool = False) -> str:
         out.append("")
     out.append("## Method and limits")
     out.append("")
-    out.append("- Components are matched by ID where exports provide one (forms, views, charts, dashboards, plug-in steps, processes), otherwise by schema name, then compared leaf by leaf after dropping known noise fields (introduced version, timestamps, managed flags). Change paths omit the component's root element and unkeyed wrappers; the JSON output has full paths.")
-    out.append("- Cloud flows are compared by trigger, action tree, and connection references from their JSON definitions.")
+    out.append("- Components are matched by ID where exports provide one (forms, views, charts, dashboards, plug-in steps, processes), otherwise by schema name, then compared leaf by leaf after dropping known noise fields (introduced version, timestamps, managed flags). Change paths omit the component's root element and unkeyed wrappers that have no attributes; repeated or attributed wrappers such as FetchXML filters keep positional segments. The JSON output has full paths.")
+    out.append("- Cloud flows are compared by trigger, action tree (including run-after conditions and switch cases), definition parameters, and connection references from their JSON definitions; a normalized-definition digest reports any remaining change that is not itemized.")
     out.append("- Canvas apps are opened from their .msapp package: screens, controls, property formulas, data sources, and connections are compared by content; media and images only by hash.")
     out.append("- Web resources, plug-in assemblies and packages, PCF control bundles, custom connector files, report definitions, and desktop flow definitions are compared by file hash: the report says they changed, not what changed inside them.")
     out.append("- Behavior differences that come from the target environment (existing data, other layers, missing connections) are outside what the packages can show.")

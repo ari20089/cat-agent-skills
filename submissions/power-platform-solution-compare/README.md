@@ -5,7 +5,7 @@ Compare two versions of a Power Platform solution and get a clear account of wha
 ## What it produces
 
 - A summary table of added, removed, modified, and unchanged components by type.
-- Attention items ranked by severity: removed columns, shortened fields, removed choice values, reduced privileges, changed flow triggers, new missing dependencies, and similar.
+- Attention items ranked by severity: removed columns, shortened fields, removed choice values, reduced privileges, changed flow triggers and run conditions, root components that change scope, new missing dependencies, and similar.
 - A deployment checklist: connection references to satisfy, environment variables to set, assemblies to verify, flows that will switch on, customizations to publish, and whether an Upgrade (or Stage for upgrade) is needed to remove components.
 - A detailed inventory per component type with the exact changed values.
 - Release notes in plain language when you ask for them.
