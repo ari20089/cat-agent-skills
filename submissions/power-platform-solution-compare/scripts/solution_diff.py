@@ -245,6 +245,14 @@ def component_key(el):
     return el.tag
 
 
+# Parent tag -> child tag whose order carries meaning (form layout, view column order, query sort, navigation).
+# The parent records one `@<child>-order` leaf listing its children's keys in document order, so a reorder is
+# reported as a single change while unordered collections stay order-insensitive.
+ORDERED_CHILDREN = {"tabs": "tab", "sections": "section", "columns": "column", "rows": "row", "row": "cell",
+                    "entity": "order", "link-entity": "order", "SiteMap": "Area", "Area": "Group", "Group": "SubArea",
+                    "options": "option", "steps": "step", "stages": "stage"}
+
+
 def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bool = True, repeated: bool = False):
     """Flatten an element into {path: value} for leaf comparison.
 
@@ -298,6 +306,10 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
         tags[c.tag] += 1
     for c in el:
         flatten(c, noise, child_prefix, out, sub, False, tags[c.tag] > 1)
+    ordered = ORDERED_CHILDREN.get(el.tag)
+    if ordered and tags.get(ordered, 0) > 1:
+        seq = [child_key(c)[len(ordered) + 1:-1] if child_key(c) != ordered else "?" for c in el if c.tag == ordered]
+        out[f"{path}/@{ordered}-order"] = " > ".join(seq)
     return out
 
 
@@ -375,6 +387,16 @@ def diff_flat(a, b, limit: int):
             changes.remove(old)
             changes.remove(new)
             changes.append({"path": old["path"], "kind": "renamed", "new_path": new["path"], "leaves": old["leaves"]})
+
+    def keep_order_leaf(c):
+        leaf = c["path"].rsplit("/", 1)[-1]
+        if not (leaf.startswith("@") and leaf.endswith("-order")):
+            return True
+        if c["kind"] != "changed":
+            return False  # the sequence leaf appeared or vanished with the member count; members report themselves
+        o, n = str(c.get("old", "")).split(" > "), str(c.get("new", "")).split(" > ")
+        return sorted(o) == sorted(n)  # keep only a pure reorder; membership changes are already reported
+    changes = [c for c in changes if keep_order_leaf(c)]
     total = len(changes)
     return changes[:limit], total
 
@@ -637,6 +659,7 @@ def flow_summary(pkg: Package, json_name: str):
     canon = json.dumps(_norm_connector_ids(_strip_designer_meta(definition)), sort_keys=True, default=str)
     return {"triggers": triggers, "actions": flow_actions(definition.get("actions")),
             "connections": conns, "parameters": json_leaves(definition.get("parameters") or {}),
+            "bindings": json_leaves(props.get("parameters") or {}) if isinstance(props.get("parameters"), dict) else {},
             "def_hash": hashlib.sha256(canon.encode()).hexdigest()[:12]}
 
 
@@ -1058,19 +1081,53 @@ def extract_envvars(root, pkg, noise, components):
         extra = {"type": ENV_TYPES.get(text(ev, "type"), text(ev, "type")), "default": text(ev, "defaultvalue"),
                  "current_values": values, "display": text(ev, "displayname")}
         add(components, Component("Environment variables", schema, schema, flatten(ev, noise), extra))
-    # Full exports may carry one folder per definition instead of inline values.
+    # Full exports may carry one folder per definition: environmentvariabledefinition.xml and, when a current value
+    # is packaged, environmentvariablevalues.json. Merge both with any inline definition so a change confined to
+    # the packaged value is still a change.
+    folders = defaultdict(dict)
     for f in pkg.find("environmentvariabledefinitions/"):
         parts = f.split("/")
-        if len(parts) >= 3 and parts[1] not in {c.key for (t, _), c in components.items() if t == "Environment variables"}:
-            schema = parts[1]
-            data = pkg.files[f]
+        if len(parts) >= 3:
+            folders[parts[1]][parts[-1].lower()] = f
+    for schema, files in folders.items():
+        comp = components.get(("Environment variables", schema))
+        if comp is None:
+            xml_file = next((f for n, f in files.items() if n.endswith(".xml")), None)
+            if xml_file:
+                try:
+                    el = ET.fromstring(pkg.files[xml_file])
+                except ET.ParseError:
+                    el = None
+                if el is not None:
+                    comp = Component("Environment variables", schema, schema, flatten(el, noise),
+                                     {"type": ENV_TYPES.get(text(el, "type"), text(el, "type")), "default": text(el, "defaultvalue"),
+                                      "current_values": [], "display": text(el, "displayname")})
+                    add(components, comp)
+        if comp is None:
+            continue
+        for n, f in files.items():
+            if not n.endswith(".json"):
+                continue
             try:
-                el = ET.fromstring(data)
-                add(components, Component("Environment variables", schema, schema, flatten(el, noise),
-                                          {"type": ENV_TYPES.get(text(el, "type"), text(el, "type")), "default": text(el, "defaultvalue"),
-                                           "current_values": [], "display": text(el, "displayname")}))
-            except ET.ParseError:
-                pass
+                doc = json.loads(pkg.files[f].decode("utf-8-sig"))
+            except Exception:
+                comp.flat[f"packagedvalues/{n}"] = (pkg.hash(f) or "unreadable")
+                continue
+            vals = []
+            def walk(node):
+                if isinstance(node, dict):
+                    if "value" in node and any(k.lower().startswith(("environmentvariable", "schemaname")) for k in node):
+                        vals.append(str(node.get("value")))
+                    for v in node.values():
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+            walk(doc)
+            if vals:
+                comp.extra["current_values"] = list(comp.extra.get("current_values") or []) + vals
+                for i, v in enumerate(vals, 1):
+                    comp.flat[f"environmentvariablevalue#{i}/value"] = v
 
 
 HANDLED = {"Entities", "Workflows", "Roles", "WebResources", "CanvasApps", "environmentvariabledefinitions", "SolutionPluginAssemblies",
@@ -1267,7 +1324,7 @@ def build_refs(components):
         if ctype == "Command bars":
             for k, v in c.flat.items():
                 if ("library" in k.lower() or "function" in k.lower()) and v and "$webresource:" in str(v):
-                    idx["webresource_users"][str(v).split("$webresource:")[-1]].add(f"command bar {c.label}")
+                    idx["webresource_users"][str(v).split("$webresource:")[-1].strip().lower()].add(f"command bar {c.label}")
     return idx
 
 
@@ -1315,7 +1372,7 @@ def cross_reference(results, bc, cc, flags):
                 item.setdefault("used_by", []).append(f"canvas app {c.label}")
     for t in ("Web resources",):
         for item in results.get(t, {}).get("modified", []) + results.get(t, {}).get("removed", []):
-            users = sorted(refs_new["webresource_users"].get(item["key"], []))
+            users = sorted(refs_new["webresource_users"].get(item["key"].lower(), []))
             if users:
                 item["used_by"] = users
                 notes.append(f"Web resource {item['key']} is used by: {', '.join(users)}")
@@ -1491,6 +1548,19 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
         pchanged = [d for d in detail if d.startswith("parameter ")]
         if pchanged:
             flag(flags, "medium", "Cloud flows", key, f"{len(pchanged)} flow definition parameter(s) changed; defaults and dependent values change behavior")
+    ob, nb = old.get("bindings") or {}, new.get("bindings") or {}
+    if isinstance(ob, dict) and isinstance(nb, dict) and ob != nb:
+        bl = []
+        for b in ob:
+            if b not in nb:
+                bl.append(f"parameter binding removed: {b}")
+            elif ob[b] != nb[b]:
+                bl.append(f"parameter binding changed: {b} ({ob[b]!r} -> {nb[b]!r})")
+        for b in nb:
+            if b not in ob:
+                bl.append(f"parameter binding added: {b} = {nb[b]!r}")
+        detail.extend(bl)
+        flag(flags, "medium", "Cloud flows", key, f"{len(bl)} runtime parameter binding(s) changed (properties.parameters); values used by @parameters() change")
     if not detail and old.get("def_hash") and new.get("def_hash") and old["def_hash"] != new["def_hash"]:
         detail.append("flow definition changed in parts not itemized above (normalized definition digest differs); review the definition JSON")
         flag(flags, "medium", "Cloud flows", key, "definition changed in parts the comparison does not itemize; review the flow JSON and run the flow end to end")
