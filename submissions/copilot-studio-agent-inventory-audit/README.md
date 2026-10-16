@@ -53,7 +53,7 @@ python3 scripts/agent_inventory_audit.py agents.json --departing <object-id> --a
 - The report's reference date is used for age calculations; it is not the time the export was taken. Sharing, quarantine, and account state change daily, so note when the export was made.
 - The inventory API and `pac resource-query` return pages of up to 1,000 records. Pass every page file to the script together; a run on a truncated page is marked incomplete in the report header.
 - Finding IDs (F1, F2, …) are numbered per run; a `--brief`, `--environment`, `--agent`, or `--owner` run renumbers them, so quote the run you attach and cross-reference by rule ID.
-- The same bot ID can exist in several environments when a solution is deployed to each; the script audits each deployment separately and merges duplicates only within one environment.
+- The same bot ID can exist in several environments when a solution is deployed to each; the script audits each deployment separately and merges duplicates only within one environment. When one file names the environment (admin center CSV) and another gives its ID (API), pass `--environments` so the names resolve and the records merge.
 - The departing-owner rule runs only when you pass `--departing` or a user list with an account-enabled or status column; owners missing from the list are reported as unknown, not as active.
 - Owners appear as object IDs unless you supply a user list or the admin center CSV already carries names. `--departing` by UPN needs the user list to map UPNs to object IDs.
 - Harness is derived from other fields when the export has no harness column; the report marks it.

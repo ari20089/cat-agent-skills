@@ -38,7 +38,7 @@ Turn an agent inventory export into a precise account of the governance posture 
 
 ## 1. Identify the export and the scope
 
-Accept an export in any of these forms: a CSV downloaded from the Power Platform admin center inventory pages, JSON from the Power Platform inventory API or `pac resource-query`, or Azure Resource Graph results as JSON or CSV. The [field catalog](references/field-catalog.md) shows how to produce each one, what each contains, and the formats of the optional user and environment files. Several files can be combined; the same agent appearing twice is merged by ID within its environment. The same bot ID in two environments (a solution deployed to both) is two agents, and the warnings say so.
+Accept an export in any of these forms: a CSV downloaded from the Power Platform admin center inventory pages, JSON from the Power Platform inventory API or `pac resource-query`, or Azure Resource Graph results as JSON or CSV. The [field catalog](references/field-catalog.md) shows how to produce each one, what each contains, and the formats of the optional user and environment files. Several files can be combined; the same agent appearing twice is merged by ID within its environment. The same bot ID in two environments (a solution deployed to both) is two agents, and the warnings say so. If an admin center CSV and an API export are combined without an environment export, the same agent can appear twice because one file names the environment and the other gives its ID; ask for `--environments` before reading counts.
 
 If the user has no export, do not audit from memory or from what they tell you about their agents. Give the export routes and reader roles from the field catalog and the script command, then stop.
 

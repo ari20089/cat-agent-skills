@@ -601,7 +601,16 @@ def agent_key(rec):
     part of the key: environment IDs are already tenant-unique, and CSV exports omit the tenant.)"""
     if not rec.get("id"):
         return None
-    return "%s|%s" % ((rec.get("environmentId") or "").lower(), rec["id"].lower())
+    return "%s|%s" % (env_identity(rec), rec["id"].lower())
+
+
+def env_identity(rec):
+    """Environment ID when known, else the environment name (admin center CSVs name environments), else ''."""
+    if rec.get("environmentId"):
+        return rec["environmentId"].lower()
+    if rec.get("environmentName"):
+        return "name:" + rec["environmentName"].strip().lower()
+    return ""
 
 
 def finalize(rec):
@@ -806,8 +815,35 @@ def custom_connector(connector_id):
     return low.startswith("shared_") and bool(re.search(r"-5f[0-9a-f]{8,}$", low))
 
 
+def coverage_of(agents):
+    """Per-field {present, populated} counts over a list of records."""
+    cov = OrderedDict()
+    fields = [f for f in FIELD_ALIASES if f not in JOIN_FIELDS] + ["connectorOperations"]
+    for field in fields:
+        present = sum(1 for a in agents if field in a["_present"])
+        populated = 0
+        for a in agents:
+            value = a.get(field)
+            if field == "connectorOperations":
+                value = a.get("_connectorDetail") or None
+            if not field_blank(field, value):
+                populated += 1
+        cov[field] = {"present": present, "populated": populated}
+    return cov
+
+
+def sum_coverage(covs):
+    out = OrderedDict()
+    for cov in covs:
+        for field, c in cov.items():
+            cell = out.setdefault(field, {"present": 0, "populated": 0})
+            cell["present"] += c["present"]
+            cell["populated"] += c["populated"]
+    return out
+
+
 class Audit:
-    def __init__(self, agents, environments, users, opts, coverage_agents=None):
+    def __init__(self, agents, environments, users, opts, coverage_agents=None, source_coverage=None):
         self.agents = agents
         self.by_id = {agent_key(a): a for a in agents if agent_key(a)}
         self.environments = environments
@@ -820,15 +856,17 @@ class Audit:
         # Rule availability also needs the field in the file(s) the audited agents come from, so a scoped audit
         # of agents from a CSV is not enabled by fields that only another file carries. Optional JSON properties
         # that happen to be unset for every in-scope agent still count, because their file carries them.
+        # Source coverage is taken from the records as each file supplied them (before duplicates were merged),
+        # so a field another file added to one agent does not make the whole file look like it carries it.
         everyone = coverage_agents if coverage_agents is not None else agents
-        self.source_coverage = {}
-        for source in sorted(set(s for a in everyone for s in a["_sources"])):
-            self.source_coverage[source] = self._coverage([a for a in everyone if source in a["_sources"]])
-        if coverage_agents is not None:
-            sources = set(s for a in agents for s in a["_sources"])
-            self.scope_coverage = self._coverage([a for a in coverage_agents if a["_sources"] & sources])
+        if source_coverage is not None:
+            self.source_coverage = source_coverage
         else:
-            self.scope_coverage = self.coverage
+            self.source_coverage = OrderedDict()
+            for source in sorted(set(s for a in everyone for s in a["_sources"])):
+                self.source_coverage[source] = self._coverage([a for a in everyone if source in a["_sources"]])
+        sources = sorted(set(s for a in agents for s in a["_sources"]))
+        self.scope_coverage = sum_coverage([self.source_coverage[s] for s in sources if s in self.source_coverage]) if sources else self.coverage
         self.gaps = []  # evidence gaps found while rules ran; reported as warnings
         self.partial = OrderedDict()  # rule -> (agents skipped, {source: count}, fields) when only part of the scope carried the fields
         self.departing = set(x.strip().lower() for x in (opts.departing or "").split(",") if x.strip())
@@ -838,19 +876,7 @@ class Audit:
 
     # -- coverage -----------------------------------------------------------
     def _coverage(self, agents):
-        cov = OrderedDict()
-        fields = [f for f in FIELD_ALIASES if f not in JOIN_FIELDS] + ["connectorOperations"]
-        for field in fields:
-            present = sum(1 for a in agents if field in a["_present"])
-            populated = 0
-            for a in agents:
-                value = a.get(field)
-                if field == "connectorOperations":
-                    value = a.get("_connectorDetail") or None
-                if not field_blank(field, value):
-                    populated += 1
-            cov[field] = {"present": present, "populated": populated}
-        return cov
+        return coverage_of(agents)
 
     def fields_absent(self):
         return [f for f, c in self.coverage.items() if c["present"] == 0]
@@ -1014,6 +1040,7 @@ class Audit:
         finding = {
             "rule": rule, "title": RULES[rule][0], "category": RULES[rule][1], "severity": severity,
             "agentIds": [a.get("id") for a in agents if a.get("id")],
+            "agentKeys": [agent_key(a) for a in agents if agent_key(a)],
             "agentId": agents[0].get("id") if len(agents) == 1 else None,
             "agentName": self.agent_label(agents[0]) if len(agents) == 1 else "%d agents" % len(agents),
             "environment": self.labels_for(agents, self.env_label) if agents else "",
@@ -1509,6 +1536,11 @@ def build_connector_table(audit):
     return sorted(rows.values(), key=lambda r: (-r["agents"], r["connectorId"]))
 
 
+def row_key(audit, agent):
+    """Environment-qualified agent key, or the label for an agent without an ID."""
+    return agent_key(agent) or "name:" + audit.agent_label(agent)
+
+
 def build_shared_connections(audit):
     rows = []
     for conn, agents in audit.shared_connections().items():
@@ -1516,6 +1548,7 @@ def build_shared_connections(audit):
         rows.append({
             "connectionId": conn, "agents": len(items),
             "agentIds": [a.get("id") for a, _ in items if a.get("id")],
+            "agentKeys": [row_key(audit, a) for a, _ in items],
             "agentNames": [audit.agent_label(a) for a, _ in items],
             "connectorIds": sorted(set(c for _, cids in items for c in cids)),
             "ownerIds": dedupe([a.get("ownerId") for a, _ in items if a.get("ownerId")]),
@@ -1593,7 +1626,7 @@ def build_remediation(audit):
             agent_keys = set()
             for f in hits:
                 for a in f["_agents"]:
-                    agent_keys.add(a.get("id") or id(a))
+                    agent_keys.add(agent_key(a) or id(a))
             counts = sev_counts(hits)
             if rule == "OW3":
                 scale = "%s (%s)" % (plural(len(hits), "owner"), plural(len(agent_keys), "agent"))
@@ -2261,13 +2294,12 @@ def render_handover(ctx, owner_key):
     lines.append("")
     lines.append("## Shared connections and dependents")
     lines.append("")
-    owned_keys = set(a.get("id") or id(a) for a in owned)
-    owned_names = set(audit.agent_label(a) for a in owned)
+    owned_keys = set(row_key(audit, a) for a in owned)
     conn_rows = []
     for r in ctx["sharedConnections"]:
-        if not (any(aid in owned_keys for aid in r["agentIds"]) or any(n in owned_names for n in r["agentNames"])):
+        if not any(k in owned_keys for k in r["agentKeys"]):
             continue
-        others = [n for n in r["agentNames"] if n not in owned_names]
+        others = [n for k, n in zip(r["agentKeys"], r["agentNames"]) if k not in owned_keys]
         conn_rows.append((r["connectionId"], capped([shorten_id(c) for c in r["connectorIds"]], 4), "%d: %s" % (r["agents"], capped(r["agentNames"], 4, "; ")), capped(others, 4, "; ") or "none", capped([o for o in r["owners"] if o != label], 3, "; ") or "none"))
     if conn_rows:
         lines.append("Maker-provided connections in this owner's agents. The inventory records which connection is shared, not who owns it; if it is this person's, every listed agent stops when the account is removed.")
@@ -2598,7 +2630,13 @@ def main(argv=None):
         problems = []
         for total, group in groups.items():
             supplied = len(group["keys"]) + group["nokey"]
+            n_files, n_trunc = len(group["files"]), len(group["truncated"])
             if total is not None and supplied >= total:
+                # One query's pages are n-1 truncated pages plus a final one; several complete single pages have none.
+                if n_trunc == 0 or n_trunc == n_files - 1:
+                    continue
+                problems.append("%s share totalRecords=%d but %d of %d pages are truncated, so they look like pages of different queries that are each missing their final page (%d distinct records supplied)" % (
+                    ", ".join(group["files"]), total, n_trunc, n_files, supplied))
                 continue
             if group["truncated"]:
                 problems.append("%s %s a truncated page (resultTruncated or skipToken set)%s" % (
@@ -2632,6 +2670,12 @@ def main(argv=None):
                 rec["environmentId"] = next(iter(ids))
                 rec["_present"].add("environmentId")
 
+    # Per-file coverage is measured before merging, so enrichment of one agent by another file is not
+    # attributed to the file that lacked the field.
+    source_coverage = OrderedDict()
+    for source in dedupe([r["_source"] for r in raw_agents]):
+        source_coverage[source] = coverage_of([r for r in raw_agents if r["_source"] == source])
+
     agents = []
     seen = {}
     by_bare_id = {}  # bare agent ID -> kept records, for records whose environment is unknown
@@ -2641,13 +2685,16 @@ def main(argv=None):
         if first is None and rec.get("id"):
             # A record with no environment (or a candidate with none) merges into the only record with that ID.
             candidates = by_bare_id.get(rec["id"].lower(), [])
-            if len(candidates) == 1 and (not rec.get("environmentId") or not candidates[0].get("environmentId")):
+            if len(candidates) == 1 and (not env_identity(rec) or not env_identity(candidates[0])):
                 first = candidates[0]
         if first is not None:
             if first.get("_harnessDerived"):
                 first["harness"] = None  # let an explicit harness from the second record win over an inferred one
             for field in FIELD_ALIASES:
-                if field not in rec["_present"] or field == "powerPlatformConnectors":
+                if field not in rec["_present"]:
+                    continue
+                if field == "powerPlatformConnectors":
+                    first["_present"].add(field)  # values are merged below; the column still counts as present
                     continue
                 if field not in first["_present"] or field_blank(field, first.get(field)):
                     if not field_blank(field, rec.get(field)) or field not in first["_present"]:
@@ -2673,7 +2720,7 @@ def main(argv=None):
     same_id = Counter((a.get("id") or "").lower() for a in agents if a.get("id"))
     cross_env = sum(1 for n in same_id.values() if n > 1)
     if cross_env:
-        warnings.append("%s in more than one environment (the same bot deployed through a solution); each deployment is audited separately. Use --environment with --agent to pick one." % plural(cross_env, "agent ID appears", "agent IDs appear"))
+        warnings.append("%s in more than one environment: the same bot deployed through a solution, or one file naming the environment while another gives its ID. Each is audited separately; pass --environments so names resolve to IDs, and use --environment with --agent to pick one." % plural(cross_env, "agent ID appears", "agent IDs appear"))
     no_id = sum(1 for a in agents if not a.get("id"))
     if no_id:
         warnings.append("%d agent records have no ID column; findings for them cannot be cross-referenced." % no_id)
@@ -2725,7 +2772,7 @@ def main(argv=None):
         warnings.append("0 of %d distinct owner keys matched the user list. Owner keys in the export are %s; the user list needs a matching id, UPN, or name column." % (
             len(owner_keys), "object IDs" if all(re.fullmatch(r"[0-9a-f-]{32,36}", k) for k in owner_keys) else "names or UPNs"))
 
-    audit = Audit(agents, env_map, users, opts, coverage_agents=all_agents)
+    audit = Audit(agents, env_map, users, opts, coverage_agents=all_agents, source_coverage=source_coverage)
     for value in sorted(audit.departing):
         matched = any(audit._departing(k)[0] and (k == value or (users.get(k, {}).get("upn") == value) or (users.get(k, {}).get("id") == value)) for k in owner_keys)
         if not matched:
