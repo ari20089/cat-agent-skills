@@ -578,9 +578,13 @@ def json_leaves(node, prefix="", out=None):
     if out is None:
         out = OrderedDict()
     if isinstance(node, dict):
+        if not node and prefix:
+            out[prefix] = "{}"  # an empty object is still a value, and differs from an empty array or a missing key
         for k, v in node.items():
             json_leaves(v, f"{prefix}/{k}" if prefix else k, out)
     elif isinstance(node, list):
+        if not node and prefix:
+            out[prefix] = "[]"
         for i, v in enumerate(node):
             json_leaves(v, f"{prefix}[{i}]", out)
     else:
@@ -1779,13 +1783,17 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
     bm, cm = parse_manifest(base), parse_manifest(cand)
     bc, cc = extract_all(base, noise), extract_all(cand, noise)
     warnings, flags = [], []
-    patch = False
     bn, cn = bm.get("unique_name", ""), cm.get("unique_name", "")
     strip = lambda n: re.sub(r"_(Patch|Upgrade)(_[0-9a-fA-F]+)?$", "", n)
+    is_patch = lambda n: bool(re.search(r"_Patch(_[0-9a-fA-F]+)?$", n or ""))
+    patch = is_patch(cn)
+    if patch and bn == cn:
+        warnings.append(f"Both packages are versions of the patch '{cn}'. A patch carries only changed components: components absent from the candidate are not removed on import, so no removal findings are raised.")
     if bn and cn and bn != cn:
-        if strip(cn) == strip(bn) and re.search(r"_Patch(_[0-9a-fA-F]+)?$", cn):
-            patch = True
+        if strip(cn) == strip(bn) and patch:
             warnings.append(f"Candidate '{cn}' is a patch of '{bn}'. A patch carries only changed components: components absent from it are not removed, so no removal findings are raised.")
+        elif patch:
+            warnings.append(f"Candidate '{cn}' is a patch, but of a different solution than baseline '{bn}'. Components absent from it are not removed on import; no removal findings are raised.")
         elif strip(cn) == strip(bn):
             warnings.append(f"Candidate '{cn}' is an upgrade holding solution for '{bn}'; results compare it with the base solution.")
         else:

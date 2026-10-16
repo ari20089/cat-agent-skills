@@ -31,7 +31,7 @@ Confirm direction. The baseline is the older or currently deployed package; the 
 
 Rules for the manifests:
 
-- **Different unique names:** stop and ask, unless the candidate is a patch (`<name>_Patch_<hex>`) or an upgrade holding solution (`<name>_Upgrade`) of the baseline. A patch carries only changed components, so components absent from it are not removed; say so and raise no removal findings.
+- **Different unique names:** stop and ask, unless the candidate is a patch (`<name>_Patch_<hex>`) or an upgrade holding solution (`<name>_Upgrade`) of the baseline. A patch carries only changed components, so components absent from it are not removed; say so and raise no removal findings. The same applies when both packages are versions of one patch.
 - **Candidate version not higher:** continue and warn. Same-version comparisons between environments are normal. A lower version cannot be imported over a higher one on a managed target.
 - **Managed versus unmanaged:** continue and warn; report managed flags and default-value differences as packaging noise.
 - **Different publisher for the same unique name:** warn that the candidate cannot be imported over the installed solution.
