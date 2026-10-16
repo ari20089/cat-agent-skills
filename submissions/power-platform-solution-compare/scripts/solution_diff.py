@@ -119,7 +119,7 @@ def _reroot(files: "dict[str, bytes]", label: str) -> "dict[str, bytes]":
     """If customizations.xml sits inside a wrapper folder (zip extracted into a subfolder), strip that prefix.
     Refuse `pac solution unpack` source, whose Other/Customizations.xml is incomplete."""
     lowered = {k.lower(): k for k in files}
-    if any(k.startswith("other/") and k.endswith("customizations.xml") for k in lowered) or \
+    if any(re.search(r"(^|/)other/(customizations|solution)\.xml$", k) for k in lowered) or \
        any(re.match(r"^(.*/)?entities/[^/]+/entity\.xml$", k) for k in lowered):
         sys.exit(f"error: {label} looks like source unpacked with `pac solution unpack` (Other/Customizations.xml, Entities/*/Entity.xml). "
                  "Repack it with `pac solution pack` and compare the resulting .zip, or compare the unpacked files directly.")
@@ -551,13 +551,12 @@ def flow_actions(node, prefix="", out=None):
 
 
 def json_leaves(node, prefix="", out=None):
-    """Flatten JSON to {path: scalar} for old->new reporting."""
+    """Flatten JSON to {path: scalar} for old->new reporting. Callers remove designer metadata at the node
+    level first; nested `metadata` keys are user data and are kept."""
     if out is None:
         out = OrderedDict()
     if isinstance(node, dict):
         for k, v in node.items():
-            if k == "metadata":
-                continue
             json_leaves(v, f"{prefix}/{k}" if prefix else k, out)
     elif isinstance(node, list):
         for i, v in enumerate(node):
@@ -581,12 +580,38 @@ def leaf_diff_lines(old, new, limit=8):
     return lines[:limit] + ([f"… {more} more"] if more > 0 else [])
 
 
-def _strip_meta(node):
-    if isinstance(node, dict):
-        return {k: _strip_meta(v) for k, v in node.items() if k != "metadata"}
-    if isinstance(node, list):
-        return [_strip_meta(v) for v in node]
-    return node
+def _strip_designer_meta(definition):
+    """Return a copy of a flow definition without the designer's `metadata` objects (operationMetadataId and
+    similar), which sit directly on trigger and action nodes. `metadata` keys anywhere else (inside inputs,
+    parameters, or payloads) are user data and are kept."""
+    if not isinstance(definition, dict):
+        return definition
+    def actions(node):
+        if not isinstance(node, dict):
+            return node
+        out = {}
+        for name, body in node.items():
+            if not isinstance(body, dict):
+                out[name] = body
+                continue
+            b = {k: v for k, v in body.items() if k != "metadata"}
+            if isinstance(b.get("actions"), dict):
+                b["actions"] = actions(b["actions"])
+            if isinstance(b.get("else"), dict) and isinstance(b["else"].get("actions"), dict):
+                b["else"] = dict(b["else"], actions=actions(b["else"]["actions"]))
+            if isinstance(b.get("default"), dict) and isinstance(b["default"].get("actions"), dict):
+                b["default"] = dict(b["default"], actions=actions(b["default"]["actions"]))
+            if isinstance(b.get("cases"), dict):
+                b["cases"] = {cn: (dict(c, actions=actions(c["actions"])) if isinstance(c, dict) and isinstance(c.get("actions"), dict) else c)
+                              for cn, c in b["cases"].items()}
+            out[name] = b
+        return out
+    d = dict(definition)
+    if isinstance(d.get("triggers"), dict):
+        d["triggers"] = {k: ({kk: vv for kk, vv in v.items() if kk != "metadata"} if isinstance(v, dict) else v) for k, v in d["triggers"].items()}
+    if isinstance(d.get("actions"), dict):
+        d["actions"] = actions(d["actions"])
+    return d
 
 
 def flow_summary(pkg: Package, json_name: str):
@@ -609,9 +634,9 @@ def flow_summary(pkg: Package, json_name: str):
             conns[k] = {"api": (v.get("api") or {}).get("name", ""),
                         "reference": (v.get("connection") or {}).get("connectionReferenceLogicalName", ""),
                         "runtimeSource": v.get("runtimeSource", "")}
-    canon = json.dumps(_norm_connector_ids(_strip_meta(definition)), sort_keys=True, default=str)
+    canon = json.dumps(_norm_connector_ids(_strip_designer_meta(definition)), sort_keys=True, default=str)
     return {"triggers": triggers, "actions": flow_actions(definition.get("actions")),
-            "connections": conns, "parameters": json_leaves(_strip_meta(definition.get("parameters") or {})),
+            "connections": conns, "parameters": json_leaves(definition.get("parameters") or {}),
             "def_hash": hashlib.sha256(canon.encode()).hexdigest()[:12]}
 
 
