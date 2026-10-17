@@ -751,19 +751,45 @@ def kind_from_name(filename, in_type=None):
 
 
 def discover(root, hve_clone_dirs):
-    """Walk ROOT and return artifacts, misnamed files, and deprecated files."""
-    artifacts, misnamed, deprecated = [], [], []
+    """Walk ROOT and return artifacts, misnamed files, deprecated files, and skipped symlinks.
+
+    Symlinked folders and files are never followed: os.walk would traverse a symlink given as
+    its starting directory even with followlinks=False, which could pull files from outside
+    ROOT into the report. Every skipped link is recorded so the header can list it.
+    """
+    artifacts, misnamed, deprecated, symlinks = [], [], [], []
     root = os.path.abspath(root)
     skip_abs = set(os.path.abspath(p) for p in hve_clone_dirs)
+
+    def rel(path):
+        return posix(os.path.relpath(path, root))
+
+    def linked(path):
+        if os.path.islink(path):
+            symlinks.append(rel(path))
+            return True
+        return False
+
+    def prune(dirpath, dirnames):
+        kept = []
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            if d in SKIP_DIRS or full in skip_abs:
+                continue
+            if linked(full):
+                continue
+            kept.append(d)
+        dirnames[:] = kept
+
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and os.path.join(dirpath, d) not in skip_abs]
+        prune(dirpath, dirnames)
         base_name = os.path.basename(dirpath)
         if base_name in (".claude", ".agents"):
             skills_dir = os.path.join(dirpath, "skills")
-            if os.path.isdir(skills_dir):
+            if not linked(skills_dir) and os.path.isdir(skills_dir):
                 for dp, dns, fns in os.walk(skills_dir):
-                    dns[:] = [d for d in dns if d not in SKIP_DIRS]
-                    if "SKILL.md" in fns:
+                    prune(dp, dns)
+                    if "SKILL.md" in fns and not linked(os.path.join(dp, "SKILL.md")):
                         full = os.path.join(dp, "SKILL.md")
                         art = Artifact(full, os.path.relpath(full, root), "skill")
                         art.location = base_name
@@ -776,19 +802,21 @@ def discover(root, hve_clone_dirs):
         gh_rel_prefix = posix(os.path.relpath(gh, root))
         gh_rel_prefix = "" if gh_rel_prefix == ".github" else gh_rel_prefix[:-len(".github")]
         global_path = os.path.join(gh, "copilot-instructions.md")
-        if os.path.isfile(global_path):
+        if os.path.isfile(global_path) and not linked(global_path):
             art = Artifact(global_path, os.path.relpath(global_path, root), "global")
             art.github_rel = "copilot-instructions.md"
             art.gh_prefix = gh_rel_prefix
             artifacts.append(art)
         for type_dir, kind in (("agents", "agent"), ("prompts", "prompt"), ("instructions", "instruction"), ("skills", "skill")):
             base = os.path.join(gh, type_dir)
-            if not os.path.isdir(base):
+            if linked(base) or not os.path.isdir(base):
                 continue
             for dp, dns, fns in os.walk(base):
-                dns[:] = [d for d in dns if d not in SKIP_DIRS]
+                prune(dp, dns)
                 for fn in fns:
                     full = os.path.join(dp, fn)
+                    if fn.lower().endswith(".md") and linked(full):
+                        continue
                     rel_in_type = posix(os.path.relpath(full, base))
                     parts = rel_in_type.split("/")
                     detected = kind_from_name(fn)
@@ -830,10 +858,11 @@ def discover(root, hve_clone_dirs):
                     art.hve_copy = art.github_rel in HVE_PATHS
                     artifacts.append(art)
         dep = os.path.join(gh, "deprecated")
-        if os.path.isdir(dep):
+        if os.path.isdir(dep) and not linked(dep):
             for dp, dns, fns in os.walk(dep):
+                prune(dp, dns)
                 for fn in fns:
-                    if fn.lower().endswith(".md"):
+                    if fn.lower().endswith(".md") and not linked(os.path.join(dp, fn)):
                         deprecated.append(os.path.join(dp, fn))
     for art in artifacts:
         art.text = read_text(art.abs_path) or ""
@@ -844,10 +873,12 @@ def discover(root, hve_clone_dirs):
             art.body = body if fm is not None else art.text
         else:
             art.fm, art.fm_error, art.body = parse_frontmatter(art.text)
-    return artifacts, misnamed, deprecated
+    return artifacts, misnamed, deprecated, sorted(set(symlinks))
 
 
 def load_single(path):
+    if os.path.islink(path):
+        raise SystemExit("--file refuses a symbolic link: %s" % path)
     abs_path = os.path.abspath(path)
     fn = os.path.basename(abs_path)
     kind = kind_from_name(fn)
@@ -991,12 +1022,15 @@ def detect_workspace(root):
 
 def tracking_activity(path):
     out = OrderedDict()
+    if os.path.islink(path):
+        return out
     for sub in ("research", "plans", "changes", "reviews", "hve-builder", "security-plans", "rai-plans", "adr-plans", "dt"):
         p = os.path.join(path, sub)
-        if not os.path.isdir(p):
+        if not os.path.isdir(p) or os.path.islink(p):
             continue
         files, latest = 0, ""
         for dp, dns, fns in os.walk(p):
+            dns[:] = [d for d in dns if not os.path.islink(os.path.join(dp, d))]
             files += len([f for f in fns if f.lower().endswith(".md")])
             for d in dns:
                 if re.match(r"^\d{4}-\d{2}-\d{2}$", d) and d > latest:
@@ -1069,6 +1103,7 @@ class Audit:
         self.artifacts = []
         self.misnamed = []
         self.deprecated = []
+        self.symlinks = []
         self.ctx = OrderedDict()
         self.single = bool(args.file)
         self.as_of = args.as_of or date.today().isoformat()
@@ -1125,7 +1160,7 @@ class Audit:
             raise SystemExit("ROOT is not a folder: %s" % root)
         self.ctx = detect_workspace(root)
         clone_dirs = [c["path"] for c in self.ctx["clones"] if c["method"] != "peer-clone"]
-        self.artifacts, self.misnamed, self.deprecated = discover(root, clone_dirs)
+        self.artifacts, self.misnamed, self.deprecated, self.symlinks = discover(root, clone_dirs)
         names = self.known_agent_names()
         for art in self.artifacts:
             if art.hve_copy and not self.args.include_hve_copies:
@@ -1308,12 +1343,16 @@ class Audit:
                 self.add("SK3", art, "folder(s) outside the recognized set (%s): %s" % (", ".join(ALLOWED_SKILL_DIRS), capped(extra)),
                          fix="Move content into scripts/, references/, assets/, templates/, examples/, or tests/.")
             scripts_dir = os.path.join(art.skill_dir, "scripts")
-            if os.path.isdir(scripts_dir):
+            if os.path.islink(scripts_dir):
+                self.symlinks.append(posix(os.path.relpath(scripts_dir, self.ctx.get("root", os.getcwd()))))
+            elif os.path.isdir(scripts_dir):
                 exts = Counter()
                 surfaces = OrderedDict()
                 for dp, dns, fns in os.walk(scripts_dir):
-                    dns[:] = [d for d in dns if d not in SKIP_DIRS]
+                    dns[:] = [d for d in dns if d not in SKIP_DIRS and not os.path.islink(os.path.join(dp, d))]
                     for fn in fns:
+                        if os.path.islink(os.path.join(dp, fn)):
+                            continue
                         ext = os.path.splitext(fn)[1].lower()
                         exts[ext] += 1
                         if ext in (".py", ".sh", ".ps1", ".psm1", ".js", ".mjs", ".cjs", ".ts"):
@@ -1721,7 +1760,9 @@ def render_header(audit, brief=False):
             rows.append(("HVE Core copies", "%d, %s" % (len(copies), "audited (--include-hve-copies)" if a.args.include_hve_copies else "exempt from convention rules (pass --include-hve-copies to audit them)")))
         if a.not_evaluated:
             rows.append(("Rules not evaluated", "; ".join("%s: %s" % (k, v) for k, v in a.not_evaluated.items())))
-        rows.append(("Not visible to this audit", "whether the extension or CLI plugin is installed on a machine, which files git tracks, symlinked folders (not followed), user-level (~/.copilot, ~/.claude) and organization-level customizations, what Copilot actually discovers through settings outside the repository, the behavior of the rules in use, and the results of HVE Core's own lint commands"))
+        if a.symlinks:
+            rows.append(("Symbolic links skipped", "%s, not followed because they can point outside the workspace: %s" % (plural(len(a.symlinks), "link"), capped(sorted(set(a.symlinks)), 8))))
+        rows.append(("Not visible to this audit", "whether the extension or CLI plugin is installed on a machine, which files git tracks, symbolic links (never followed; listed above when present), user-level (~/.copilot, ~/.claude) and organization-level customizations, what Copilot actually discovers through settings outside the repository, the behavior of the rules in use, and the results of HVE Core's own lint commands"))
     rows.append(("Tool", "hve_core_workspace_audit.py %s" % TOOL_VERSION))
     out = ["# HVE Core workspace audit", "", "| Item | Value |", "| --- | --- |"]
     for k, v in rows:
@@ -1930,7 +1971,7 @@ def render_method(audit, brief=False):
             "lint commands (npm run lint:frontmatter, validate:skills, plugin:validate), which only run inside an HVE Core clone. "
             "Severity orders the work and is this tool's heuristic, not a Microsoft rating. Copies of HVE Core artifacts are "
             "identified by path and exempt by default. The frontmatter parser handles the YAML subset HVE Core artifacts use; "
-            "a file it cannot parse is reported under FM1 rather than guessed. Symlinked folders are not followed. Nothing is installed, moved, or changed." % HVE_CORE_CATALOG_VERSION)
+            "a file it cannot parse is reported under FM1 rather than guessed. Symbolic links are never followed, including a linked .github, type folder, skill folder, scripts folder, or artifact file, and the header lists the ones skipped. Nothing is installed, moved, or changed." % HVE_CORE_CATALOG_VERSION)
     if brief:
         return text
     return "## Method and limits\n\n" + text
@@ -2002,6 +2043,7 @@ def to_json(audit):
         arts.append(rec)
     data["artifacts"] = arts
     data["misnamed"] = [OrderedDict((("path", p), ("type", k), ("reason", r))) for p, k, r in audit.misnamed]
+    data["symlinksSkipped"] = sorted(set(audit.symlinks))
     if not audit.single:
         ctx = OrderedDict()
         for k, v in audit.ctx.items():
