@@ -1258,6 +1258,44 @@ SIMPLE = [
 ]
 
 
+def _asm_version(fullname: str) -> str:
+    m = re.search(r"Version=(\d+)\.(\d+)", fullname or "")
+    return f"{m.group(1)}.{m.group(2)}" if m else ""
+
+
+def reconcile_assemblies(bc, cc):
+    """Settle plug-in assembly identities across both packages. One version on each side compares by name (a
+    version bump is a modification). When either side carries several versions of one assembly, every entry is
+    keyed by name plus major.minor; a lone entry with no exact counterpart is paired with the closest version on
+    the other side so it still compares as a modification rather than as a removal plus an addition."""
+    def groups(comps):
+        g = defaultdict(list)
+        for (t, k), c in comps.items():
+            if t == "Plug-in assemblies":
+                g[c.extra.get("assembly") or k].append(c)
+        return g
+    gb, gc = groups(bc), groups(cc)
+    def vt(c):
+        return tuple(int(x) for x in (_asm_version(c.extra.get("fullname", "")) or "0.0").split("."))
+    for name in set(gb) | set(gc):
+        B, C = gb.get(name, []), gc.get(name, [])
+        if len(B) <= 1 and len(C) <= 1:
+            for c in B + C:
+                c.key = c.label = name
+            continue
+        for c in B + C:
+            c.key = c.label = f"{name} {_asm_version(c.extra.get('fullname', '')) or '?'}"
+        for lone, many in ((B, C), (C, B)):
+            if len(lone) == 1 and many and lone[0].key not in {m.key for m in many}:
+                nearest = min(many, key=lambda m: abs(vt(m)[0] - vt(lone[0])[0]) * 1000 + abs(vt(m)[1] - vt(lone[0])[1]))
+                lone[0].key = lone[0].label = nearest.key
+    for comps in (bc, cc):
+        items = list(comps.items())
+        comps.clear()
+        for (t, k), c in items:
+            comps[(t, c.key if t == "Plug-in assemblies" else k)] = c
+
+
 def extract_all(pkg: Package, noise: bool):
     components = OrderedDict()
     cdata = pkg.get("customizations.xml")
@@ -1287,13 +1325,12 @@ def extract_all(pkg: Package, noise: bool):
             for el in els:
                 by_name[el.attrib.get("FullName", "").split(",")[0].strip()].append(el)
             for name, group in by_name.items():
-                for el in group:
+                for i, el in enumerate(group):
                     full = el.attrib.get("FullName", "")
-                    m = re.search(r"Version=(\d+)\.(\d+)", full)
-                    key = name if len(group) == 1 else f"{name} {m.group(1)}.{m.group(2)}" if m else f"{name} #{group.index(el) + 1}"
+                    key = name if len(group) == 1 else f"{name} {_asm_version(full) or '#' + str(i + 1)}"
                     ident = el.attrib.get("PluginAssemblyId") or text(el, "PluginAssemblyId")
                     add(components, Component(ctype, key, key, flatten(el, noise),
-                                              {"fullname": full, "files": attached_files(pkg, "PluginAssemblies", name, ident)}))
+                                              {"fullname": full, "assembly": name, "files": attached_files(pkg, "PluginAssemblies", name, ident)}))
             continue
         if ctype == "Custom controls (PCF)":
             for el in root.findall(path):
@@ -1910,6 +1947,7 @@ def assess(ctype, comp_old, comp_new, status, changes, flags, removed_parents=fr
 def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=None):
     bm, cm = parse_manifest(base), parse_manifest(cand)
     bc, cc = extract_all(base, noise), extract_all(cand, noise)
+    reconcile_assemblies(bc, cc)
     warnings, flags = [], []
     bn, cn = bm.get("unique_name", ""), cm.get("unique_name", "")
     strip = lambda n: re.sub(r"_(Patch|Upgrade)(_[0-9a-fA-F]+)?$", "", n)
