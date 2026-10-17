@@ -245,6 +245,10 @@ def component_key(el):
     return el.tag
 
 
+# Empty, attribute-less elements whose presence alone changes behaviour (FetchXML); other empty unkeyed
+# wrappers such as <CustomActions/> are packaging skeleton and record nothing.
+PRESENCE_TAGS = {"all-attributes", "no-lock"}
+
 # Parent tag -> child tag whose order carries meaning (form layout, view column order, query sort, navigation).
 # The parent records one `@<child>-order` leaf listing its children's keys in document order, so a reorder is
 # reported as a single change while unordered collections stay order-insensitive.
@@ -266,7 +270,8 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
       repeat among siblings become positional segments (`filter`, `filter#2`) so nested and sibling
       groups keep their own attributes and children;
     - keyed leaf elements always record a presence leaf, so `<attribute name="x"/>` registers;
-      unkeyed empty wrappers such as `<CustomActions/>` record nothing.
+      unkeyed empty wrappers such as `<CustomActions/>` record nothing, except PRESENCE_TAGS
+      (`<all-attributes/>`), whose presence is itself the setting.
     """
     if out is None:
         out = OrderedDict()
@@ -300,7 +305,7 @@ def flatten(el, noise: bool, prefix: str = "", out=None, counters=None, root: bo
         out[f"{path}/@{a}"] = v
         wrote = True
     t = (el.text or "").strip()
-    if not has_children and (t or (keyed and not wrote)):
+    if not has_children and (t or (keyed and not wrote) or el.tag in PRESENCE_TAGS):
         out[path] = t
     sub = defaultdict(int) if child_prefix == path else counters
     tags = defaultdict(int)
@@ -648,7 +653,8 @@ def json_leaves(node, prefix="", out=None):
         if not node and prefix:
             out[prefix] = "{}"  # an empty object is still a value, and differs from an empty array or a missing key
         for k, v in node.items():
-            json_leaves(v, f"{prefix}/{k}" if prefix else k, out)
+            seg = str(k).replace("~", "~0").replace("/", "~1").replace("[", "~2")  # JSON-pointer style escaping
+            json_leaves(v, f"{prefix}/{seg}" if prefix else seg, out)
     elif isinstance(node, list):
         if not node and prefix:
             out[prefix] = "[]"
@@ -662,16 +668,21 @@ def json_leaves(node, prefix="", out=None):
     return out
 
 
+def _show_path(k: str) -> str:
+    """Undo JSON-pointer escaping for display only; JSON output keeps the unambiguous form."""
+    return k.replace("~1", "/").replace("~2", "[").replace("~0", "~")
+
+
 def leaf_diff_lines(old, new, limit=8):
     lines = []
     for k in old:
         if k not in new:
-            lines.append(f"{k}: {old[k]} removed")
+            lines.append(f"{_show_path(k)}: {old[k]} removed")
         elif old[k] != new[k]:
-            lines.append(f"{k}: {old[k]} → {new[k]}")
+            lines.append(f"{_show_path(k)}: {old[k]} → {new[k]}")
     for k in new:
         if k not in old:
-            lines.append(f"{k}: {new[k]} added")
+            lines.append(f"{_show_path(k)}: {new[k]} added")
     more = len(lines) - limit
     return lines[:limit] + ([f"… {more} more"] if more > 0 else [])
 
@@ -1632,12 +1643,12 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
     if isinstance(op, dict) and isinstance(npar, dict):
         for p in op:
             if p not in npar:
-                detail.append(f"parameter removed: {p}")
+                detail.append(f"parameter removed: {_show_path(p)}")
             elif op[p] != npar[p]:
-                detail.append(f"parameter changed: {p} ({op[p]} -> {npar[p]})")
+                detail.append(f"parameter changed: {_show_path(p)} ({op[p]} -> {npar[p]})")
         for p in npar:
             if p not in op:
-                detail.append(f"parameter added: {p} = {npar[p]}")
+                detail.append(f"parameter added: {_show_path(p)} = {npar[p]}")
         pchanged = [d for d in detail if d.startswith("parameter ")]
         if pchanged:
             flag(flags, "medium", "Cloud flows", key, f"{len(pchanged)} flow definition parameter(s) changed; defaults and dependent values change behavior")
@@ -1646,12 +1657,12 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
         bl = []
         for b in ob:
             if b not in nb:
-                bl.append(f"parameter binding removed: {b}")
+                bl.append(f"parameter binding removed: {_show_path(b)}")
             elif ob[b] != nb[b]:
-                bl.append(f"parameter binding changed: {b} ({ob[b]} -> {nb[b]})")
+                bl.append(f"parameter binding changed: {_show_path(b)} ({ob[b]} -> {nb[b]})")
         for b in nb:
             if b not in ob:
-                bl.append(f"parameter binding added: {b} = {nb[b]}")
+                bl.append(f"parameter binding added: {_show_path(b)} = {nb[b]}")
         detail.extend(bl)
         flag(flags, "medium", "Cloud flows", key, f"{len(bl)} runtime parameter binding(s) changed (properties.parameters); values used by @parameters() change")
     if not detail and old.get("def_hash") and new.get("def_hash") and old["def_hash"] != new["def_hash"]:
