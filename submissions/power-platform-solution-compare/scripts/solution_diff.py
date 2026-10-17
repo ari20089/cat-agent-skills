@@ -442,19 +442,27 @@ def component_type_name(code: str) -> str:
     return f"type {code}"
 
 
-def attached_files(pkg: Package, folder: str, name: str):
-    """Files under folder/ that belong to component `name`: folder/name/..., folder/name-<guid>/..., folder/name.* ."""
+GUID_RE = r"\{?[0-9a-f][0-9a-f-]*\}?"  # export folder suffixes are GUIDs; anything with other letters is another component's name
+
+
+def attached_files(pkg: Package, folder: str, name: str, ident: str = ""):
+    """Files under folder/ that belong to component `name`: folder/name/..., folder/name-<GUID>/... (the export's
+    own suffix, or the component's id when known), or a direct file name.* / name_<Kind>Uri.*. A hyphenated
+    sibling such as `Contoso-Tools` never matches `Contoso`."""
     if not name:
         return {}
-    name_l = name.lower()
+    name_l, ident_l = name.lower(), (ident or "").strip("{}").lower()
     out = {}
     for f in pkg.find(folder.rstrip("/") + "/"):
         rest = f[len(folder.rstrip("/")) + 1:]
         first = rest.split("/")[0].lower()
         stem = first.rsplit(".", 1)[0] if "/" not in rest else first
-        # folder "<name>" or "<name>-<guid or suffix>" (never "<name>.<other>"), or a direct file "<name>.*" / "<name>_<Kind>Uri.*"
-        if first == name_l or first.startswith(name_l + "-") \
-           or ("/" not in rest and (stem == name_l or re.match(re.escape(name_l) + r"_[a-z]+uri$", stem))):
+        if "/" in rest:
+            owner = first == name_l or (ident_l and first == f"{name_l}-{ident_l}") \
+                or (not ident_l and re.fullmatch(re.escape(name_l) + "-" + GUID_RE, first) is not None)
+        else:
+            owner = stem == name_l or re.match(re.escape(name_l) + r"_[a-z]+uri$", stem) is not None
+        if owner:
             out[rest] = pkg.hash(f)
     return out
 
@@ -1144,7 +1152,7 @@ def extract_canvas(root, pkg, noise, components):
             if uri:
                 hashes[tag] = pkg.hash(uri) or "missing"
         if not hashes:
-            hashes = attached_files(pkg, "CanvasApps", name)
+            hashes = attached_files(pkg, "CanvasApps", name, text(app, "CanvasAppId"))
         doc_uri = text(app, "DocumentUri")
         if not doc_uri:
             cands = [f for f in pkg.find("CanvasApps/") if f.lower().endswith(".msapp") and os.path.basename(f).lower().startswith(name.lower() + "_")]
@@ -1271,17 +1279,26 @@ def extract_all(pkg: Package, noise: bool):
         if ctype == "Plug-in steps":
             label_fn = lambda el: el.attrib.get("Name") or text(el, "Name") or text(el, "SdkMessageProcessingStepId")
         if ctype == "Plug-in assemblies":
-            # FullName embeds Version; key on the assembly name so version bumps show as modified.
-            for el in root.findall(path):
-                full = el.attrib.get("FullName", "")
-                name = full.split(",")[0].strip()
-                add(components, Component(ctype, name, name, flatten(el, noise),
-                                          {"fullname": full, "files": attached_files(pkg, "PluginAssemblies", name)}))
+            # FullName embeds Version; key on the assembly name so version bumps show as modified. When two
+            # versions of one assembly coexist in a package (side-by-side major versions), key each by
+            # name plus major.minor so neither record hides the other.
+            els = root.findall(path)
+            by_name = defaultdict(list)
+            for el in els:
+                by_name[el.attrib.get("FullName", "").split(",")[0].strip()].append(el)
+            for name, group in by_name.items():
+                for el in group:
+                    full = el.attrib.get("FullName", "")
+                    m = re.search(r"Version=(\d+)\.(\d+)", full)
+                    key = name if len(group) == 1 else f"{name} {m.group(1)}.{m.group(2)}" if m else f"{name} #{group.index(el) + 1}"
+                    ident = el.attrib.get("PluginAssemblyId") or text(el, "PluginAssemblyId")
+                    add(components, Component(ctype, key, key, flatten(el, noise),
+                                              {"fullname": full, "files": attached_files(pkg, "PluginAssemblies", name, ident)}))
             continue
         if ctype == "Custom controls (PCF)":
             for el in root.findall(path):
                 name = text(el, "Name")
-                add(components, Component(ctype, name, name, flatten(el, noise), {"files": attached_files(pkg, "Controls", name)}))
+                add(components, Component(ctype, name, name, flatten(el, noise), {"files": attached_files(pkg, "Controls", name, text(el, "CustomControlId"))}))
             continue
         extract_simple(root, path, ctype, key, components, noise, label_fn)
     seen = defaultdict(list)
@@ -1296,7 +1313,7 @@ def extract_all(pkg: Package, noise: bool):
                 c.label = f"{lab} ({st}, {md}) [{c.key[:8]}]"
     for el in root.findall("pluginpackages/pluginpackage"):
         name = el.attrib.get("name") or text(el, "name") or el.attrib.get("uniquename") or text(el, "uniquename")
-        add(components, Component("Plug-in packages", name, name, flatten(el, noise), {"files": attached_files(pkg, "pluginpackages", name)}))
+        add(components, Component("Plug-in packages", name, name, flatten(el, noise), {"files": attached_files(pkg, "pluginpackages", name, text(el, "pluginpackageid"))}))
     for el in root.findall("Reports/Report"):
         name = el.attrib.get("name") or text(el, "name") or text(el, "FileName")
         fname = text(el, "FileName")
@@ -1307,7 +1324,7 @@ def extract_all(pkg: Package, noise: bool):
             key = component_key(el)
             name = key[len(el.tag) + 1:-1] if key != el.tag else ""
             add(components, Component("Custom connectors", key, name or key, flatten(el, noise),
-                                      {"files": attached_files(pkg, "Connectors", name)}))
+                                      {"files": attached_files(pkg, "Connectors", name, text(el, "connectorid"))}))
     for wrapper in root.findall("Templates/*"):
         ctype = {"EmailTemplates": "Email templates", "MailMergeTemplates": "Mail merge templates",
                  "KBArticleTemplates": "Article templates", "ContractTemplates": "Contract templates"}.get(wrapper.tag, f"Templates: {wrapper.tag}")
@@ -1620,6 +1637,11 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
     removed = [d for d in detail if d.startswith("action removed")]
     if removed:
         flag(flags, "medium", "Cloud flows", key, f"{len(removed)} action(s) removed")
+    changed = [d for d in detail if d.startswith("action changed")]
+    added = [d for d in detail if d.startswith("action added")]
+    if changed or added:
+        bits = ([f"{len(changed)} action(s) changed (inputs, type, or case selectors)"] if changed else []) + ([f"{len(added)} action(s) added"] if added else [])
+        flag(flags, "medium", "Cloud flows", key, "; ".join(bits) + "; run the flow end to end in a test environment")
     for c, v in new["connections"].items():
         if c not in old["connections"]:
             detail.append(f"connection added: {c} -> {v['api']} via {v['reference'] or 'embedded'}")
