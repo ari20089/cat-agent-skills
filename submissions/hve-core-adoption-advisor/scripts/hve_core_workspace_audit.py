@@ -440,8 +440,26 @@ def _split_inline_list(text):
     return [yaml_scalar(i) for i in items if i != ""]
 
 
+def strip_trailing_comment(text):
+    """Remove a trailing ' # comment' that sits outside quotes and brackets; keep '#' inside strings or words."""
+    quote, depth = None, 0
+    for idx, ch in enumerate(text):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in "\"'":
+            quote = ch
+        elif ch in "[{":
+            depth += 1
+        elif ch in "]}":
+            depth -= 1
+        elif ch == "#" and depth <= 0 and (idx == 0 or text[idx - 1] in " \t"):
+            return text[:idx].rstrip()
+    return text
+
+
 def yaml_scalar(text):
-    s = text.strip()
+    s = strip_trailing_comment(text).strip()
     if s == "":
         return ""
     if s[0] in "\"'":
@@ -505,13 +523,19 @@ def _collect_block_scalar(lines, i, parent_indent, style):
 
 def _collect_quoted(lines, i, first):
     q = first[0]
+    first = strip_trailing_comment(first)
     if len(first) > 1 and first.endswith(q) and not first.endswith("\\" + q):
         return yaml_scalar(first), i + 1
     parts = [first]
     i += 1
     while i < len(lines):
-        parts.append(lines[i].strip())
-        if lines[i].rstrip().endswith(q):
+        piece = lines[i].strip()
+        if q == '"':
+            closed = re.search(r'(?<!\\)"(\s+#.*)?$', piece) is not None
+        else:
+            closed = re.search(r"'(\s+#.*)?$", piece) is not None and not piece.endswith("''")
+        parts.append(strip_trailing_comment(piece) if closed else piece)
+        if closed:
             return yaml_scalar(" ".join(parts)), i + 1
         i += 1
     raise YAMLError("unterminated quoted string")
@@ -551,6 +575,10 @@ def parse_map(lines, i, indent):
             raise YAMLError("expected 'key: value' at line %d" % (i + 1))
         key = m.group(1).strip().strip("\"'")
         rest = (m.group(2) or "").strip()
+        if rest.startswith("#"):
+            rest = ""
+        elif rest[:1] not in "\"'":
+            rest = strip_trailing_comment(rest).strip()
         if rest == "":
             j = i + 1
             while j < len(lines) and _is_blank(lines[j]):
@@ -606,6 +634,10 @@ def parse_seq(lines, i, indent):
         if not (content == "-" or content.startswith("- ")):
             break
         item = content[1:].strip()
+        if item.startswith("#"):
+            item = ""
+        elif item[:1] not in "\"'":
+            item = strip_trailing_comment(item).strip()
         if item == "":
             value, i = parse_node(lines, i + 1, indent + 1)
             result.append(value)
@@ -1257,7 +1289,13 @@ class Audit:
         fm = art.fm
         folder = os.path.basename(art.skill_dir) if art.skill_dir else ""
         name = art.name
-        if name and folder and name != folder:
+        raw_name = fm.get("name")
+        if not name:
+            what = "missing" if raw_name is None else ("blank" if isinstance(raw_name, str) else "not a string (%s)" % type(raw_name).__name__)
+            self.add("SK1", art, "name is %s; it is required and must equal the folder '%s', which is how Copilot and HVE Core's skill validation find the skill" % (what, folder or "<skill folder>"),
+                     fix="Add name: %s." % (folder or "<folder-name>"))
+            return
+        if folder and name != folder:
             self.add("SK1", art, "name '%s' differs from the folder '%s'; Copilot and HVE Core's skill validation key the skill by that match" % (name, folder),
                      fix="Set name: to the folder name, or rename the folder.")
         if name and (not KEBAB.match(name) or len(name) > 64):

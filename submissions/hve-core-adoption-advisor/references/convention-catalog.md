@@ -8,7 +8,7 @@ Artifacts whose path under `.github/` matches a file HVE Core ships are "copies"
 
 Three sources feed these rules, and the text says which applies: **HVE Core's own documentation** (the default); **VS Code's agent customization documentation** for custom agents, agent skills, custom instructions, and prompt files, as read in October 2026, for statements marked "current VS Code" (model lists, prompt `agent:`, Claude-format agents, `.claude/skills` and `.agents/skills`, `AGENTS.md`, deprecated `chat.*Locations` settings, `context: fork`, silent failure of badly named skills, `agents: "*"`); and the **Agent Skills specification** at agentskills.io for `name` and `description` limits, `compatibility`, `metadata`, and `allowed-tools`. HVE Core's repository does not mention the VS Code or Agent Skills items; when the two disagree, the rule keys its severity to the stricter host and says so.
 
-The frontmatter parser supports the YAML that Copilot artifacts use: `key: value`, quoted and multi-line plain scalars, `|` and `>` block scalars, inline and block lists, nested maps, and `- key: value` list items. Anchors, aliases, tags, and flow mappings are not supported and report as FM1.
+The frontmatter parser supports the YAML that Copilot artifacts use: `key: value`, quoted and multi-line plain scalars, `|` and `>` block scalars, inline and block lists, nested maps, `- key: value` list items, and trailing `# comments` outside quotes. Anchors, aliases, tags, and flow mappings are not supported and report as FM1.
 
 ## Frontmatter fields by type
 
@@ -75,7 +75,7 @@ Model names must use the VS Code display name with the `(copilot)` suffix and ap
 
 ## Skills (SK)
 
-**SK1 Skill name does not match its folder.** High. *Why:* the folder name is the skill's identity for discovery and `copilot-skill:` references; HVE Core's `validate:skills` rejects the mismatch. *Fix:* make them equal.
+**SK1 Skill name does not match its folder.** Also fires when `name` is missing, blank, or not a string. High. *Why:* the folder name is the skill's identity for discovery and `copilot-skill:` references; HVE Core's `validate:skills` rejects the mismatch, and a skill without a name cannot be found by one. *Fix:* make them equal.
 
 **SK2 Name not lowercase kebab-case.** Also fires above 64 characters. Medium. *Why:* the Agent Skills specification allows only `a-z`, `0-9`, and single hyphens up to 64 characters, and VS Code's agent skills documentation says a skill with invalid characters, dots, colons, slashes, or a namespace prefix fails to load silently. *Fix:* lowercase letters, digits, single hyphens.
 
