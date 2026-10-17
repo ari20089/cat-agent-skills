@@ -492,6 +492,11 @@ def fetch_column_refs(el, primary: str):
     layout cells named `alias.column` to the aliased table."""
     refs, alias = set(), {}
 
+    def index_aliases(node):  # aliases can be referenced by conditions that precede the link in document order
+        for c in node.iter():
+            if c.tag.lower() == "link-entity" and c.attrib.get("alias") and c.attrib.get("name"):
+                alias[c.attrib["alias"]] = c.attrib["name"]
+
     def walk(node, table):
         for c in node:
             tag = c.tag.lower()
@@ -499,6 +504,10 @@ def fetch_column_refs(el, primary: str):
                 t = c.attrib.get("name") or table
                 if c.attrib.get("alias"):
                     alias[c.attrib["alias"]] = t
+                if c.attrib.get("from"):
+                    refs.add((t, c.attrib["from"]))  # join column on the linked table
+                if c.attrib.get("to"):
+                    refs.add((table, c.attrib["to"]))  # join column on the parent table
                 walk(c, t)
             elif tag == "attribute":
                 if c.attrib.get("name"):
@@ -524,6 +533,8 @@ def fetch_column_refs(el, primary: str):
                 fetches.extend([f for f in parsed.iter() if f.tag.lower() == "fetch"] or ([parsed] if parsed.tag.lower() == "fetch" else []))
             except ET.ParseError:
                 pass
+    for fetch in fetches:
+        index_aliases(fetch)
     for fetch in fetches:
         for ent in fetch:
             if ent.tag.lower() == "entity":
@@ -1909,9 +1920,11 @@ def assess(ctype, comp_old, comp_new, status, changes, flags, removed_parents=fr
             order = [c for c in cv if c["kind"] == "changed" and c["path"].endswith("/@child-order")]
             if order:
                 parts.append(f"{len(order)} control order change(s)")
-            props = [c for c in cv if c["kind"] == "changed" and "/@" in c["path"] and not c["path"].endswith(("/@template", "/@child-order")) and c["path"].startswith(("screen[", "component[", "app["))]
+            props = [c for c in cv if c["kind"] in ("changed", "added", "removed") and "/@" in c["path"] and not c["path"].endswith(("/@template", "/@child-order")) and c["path"].startswith(("screen[", "component[", "app["))]
             if props:
-                parts.append(f"{len(props)} property formula(s) changed")
+                kinds = {"changed": "changed", "added": "added", "removed": "removed"}
+                summary = ", ".join(f"{sum(1 for c in props if c['kind'] == k)} {v}" for k, v in kinds.items() if any(c["kind"] == k for c in props))
+                parts.append(f"{len(props)} property formula(s) {summary}" if len(set(c["kind"] for c in props)) > 1 else f"{len(props)} property formula(s) {props[0]['kind']}")
             tmpls = [c for c in cv if c["kind"] == "changed" and c["path"].endswith("/@template")]
             if tmpls:
                 parts.append(f"{len(tmpls)} control type or version change(s)")
@@ -2042,8 +2055,10 @@ def compare(base: Package, cand: Package, noise: bool, limit: int, only_types=No
                     detail.append("packaged files changed: " + ", ".join(changed_files[:8]) + (" …" if len(changed_files) > 8 else ""))
                 if o.extra.get("xaml_hash") != n.extra.get("xaml_hash"):
                     detail.append("process definition (XAML) changed")
+                    flag(flags, "medium", t, o.label, "definition (XAML) changed; the logic is compared by hash only, review it and test the affected records")
                 if t != "Cloud flows" and o.extra.get("json_hash") != n.extra.get("json_hash"):
                     detail.append("process definition (JSON) changed")
+                    flag(flags, "medium", t, o.label, "definition (JSON) changed; the logic is compared by hash only, review it and test the affected records")
                 if all_changes or detail or extra_changed:  # the display limit must never decide the status
                     bucket["modified"].append({"key": k, "label": n.label, "changes": changes, "total_changes": total, "detail": detail,
                                                "extra": {kk: vv for kk, vv in n.extra.items() if kk not in ("flow", "options")}})
