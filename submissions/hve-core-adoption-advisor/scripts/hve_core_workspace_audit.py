@@ -876,9 +876,27 @@ def discover(root, hve_clone_dirs):
     return artifacts, misnamed, deprecated, sorted(set(symlinks))
 
 
+def linked_component(path):
+    """Return the first symbolic link among the file and its ancestors inside the customization tree.
+
+    Ancestors are checked from the nearest .github, .claude, or .agents folder in the given path
+    down to the file; when the path has none, the parent folder and the file are checked. System
+    links above the repository (such as /tmp on macOS) are left alone.
+    """
+    norm = os.path.normpath(path)
+    parts = norm.split(os.sep)
+    start = next((i for i, p in enumerate(parts) if p in (".github", ".claude", ".agents")), max(0, len(parts) - 2))
+    for idx in range(start, len(parts)):
+        prefix = os.sep.join(parts[:idx + 1]) or os.sep
+        if os.path.islink(prefix):
+            return prefix
+    return None
+
+
 def load_single(path):
-    if os.path.islink(path):
-        raise SystemExit("--file refuses a symbolic link: %s" % path)
+    link = linked_component(path)
+    if link:
+        raise SystemExit("--file refuses a path through a symbolic link (%s); links can point outside the workspace" % link)
     abs_path = os.path.abspath(path)
     fn = os.path.basename(abs_path)
     kind = kind_from_name(fn)
