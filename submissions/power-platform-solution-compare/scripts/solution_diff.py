@@ -599,6 +599,17 @@ def _norm_connector_ids(node):
     return node
 
 
+def _conn_name(inputs):
+    """connectionName from inputs.host when both are objects; Compose inputs can be any JSON value."""
+    if not isinstance(inputs, dict):
+        return ""
+    host = inputs.get("host")
+    if not isinstance(host, dict):
+        return ""
+    v = host.get("connectionName", "")
+    return v if isinstance(v, str) else ""
+
+
 def flow_actions(node, prefix="", out=None):
     if out is None:
         out = OrderedDict()
@@ -615,7 +626,7 @@ def flow_actions(node, prefix="", out=None):
         out[path] = {"type": body.get("type", ""), "hash": hashlib.sha256(canon.encode()).hexdigest()[:12],
             "runAfter": {k: (sorted(str(x) for x in v) if isinstance(v, list) else [str(v)]) for k, v in (body.get("runAfter") or {}).items()},
             "leaves": json_leaves(clean),
-            "connection": ((body.get("inputs") or {}).get("host") or {}).get("connectionName", "") if isinstance(body.get("inputs"), dict) else ""}
+            "connection": _conn_name(body.get("inputs"))}
         flow_actions(body.get("actions"), path, out)
         if isinstance(body.get("else"), dict):
             flow_actions(body["else"].get("actions"), path + "/else", out)
@@ -922,6 +933,9 @@ def _json_controls(doc, flat, parent_path, counts, templates, kind=None):
             for prm in cp.get("PropertyScopeKey", {}).get("PropertyScopeRulesKey", []) if isinstance(cp.get("PropertyScopeKey"), dict) else []:
                 if isinstance(prm, dict) and prm.get("Name"):
                     flat[f"{base}/parameter[{prm['Name']}]/@type"] = str(prm.get("ScopeVariableInfo", {}).get("ScopePropertyDataType", "") if isinstance(prm.get("ScopeVariableInfo"), dict) else "")
+    names = [c.get("Name") for c in (doc.get("Children") or []) if isinstance(c, dict) and c.get("Name")]
+    if len(names) > 1:
+        flat[f"{path}/@child-order"] = " > ".join(str(n) for n in names)  # z-order and auto-layout order
     for child in doc.get("Children") or []:
         if isinstance(child, dict):
             _json_controls(child, flat, path, counts, templates)
@@ -935,6 +949,7 @@ def _yaml_entities(y, flat, counts):
         if len(segs) >= 2 and segs[1] == "Control":
             v = str(y[path]).strip()
             kinds[segs[0]] = "app" if v == "App" else "screen" if v == "Screen" else "component" if v.lower().startswith("component") or v.endswith("Component") else "control"
+    child_order = OrderedDict()
     for path, val in y.items():
         segs = path.split("/")
         top = segs[0]
@@ -954,6 +969,9 @@ def _yaml_entities(y, flat, counts):
                 out = [f"screen[{nxt}]"]
                 j += 2
             elif seg == "Children" and nxt is not None:
+                parent = "/".join(out)
+                if nxt not in child_order.setdefault(parent, []):
+                    child_order[parent].append(nxt)
                 out.append(f"control[{nxt}]")
                 j += 2
             elif seg == "Properties" and nxt is not None:
@@ -975,6 +993,9 @@ def _yaml_entities(y, flat, counts):
                 out.append(("@" + seg) if j == len(rest) - 1 else seg)
                 j += 1
         flat["/".join(out)] = str(val)
+    for parent, names in child_order.items():  # document order is layout order in auto-layout containers
+        if len(names) > 1:
+            flat[f"{parent}/@child-order"] = " > ".join(names)
     roots = {k.split("/")[0] for k in flat}
     counts["screens"] = sum(1 for r in roots if r.startswith("screen["))
     counts["components"] = sum(1 for r in roots if r.startswith("component["))
@@ -1568,10 +1589,11 @@ def compare_flow(old, new, flags, key, old_hash=None, new_hash=None):
             detail.append(f"action moved: {a} -> {moved[a]} ({oa[a]['type']})")
         elif a not in na:
             detail.append(f"action removed: {a} ({oa[a]['type']})")
-        elif oa[a]["hash"] != na[a]["hash"] or oa[a]["type"] != na[a]["type"]:
-            detail.append(f"action changed: {a} ({oa[a]['type']}" + (f" -> {na[a]['type']}" if oa[a]['type'] != na[a]['type'] else "") + ")")
-            detail.extend(f"  {d}" for d in leaf_diff_lines(oa[a].get("leaves", {}), na[a].get("leaves", {}), 6))
-        elif oa[a]["runAfter"] != na[a]["runAfter"]:
+        else:
+            if oa[a]["hash"] != na[a]["hash"] or oa[a]["type"] != na[a]["type"]:
+                detail.append(f"action changed: {a} ({oa[a]['type']}" + (f" -> {na[a]['type']}" if oa[a]['type'] != na[a]['type'] else "") + ")")
+                detail.extend(f"  {d}" for d in leaf_diff_lines(oa[a].get("leaves", {}), na[a].get("leaves", {}), 6))
+        if a in na and a not in moved and oa[a]["runAfter"] != na[a]["runAfter"]:  # independent of input changes
             ora, nra = oa[a]["runAfter"], na[a]["runAfter"]
             if isinstance(ora, dict) and isinstance(nra, dict) and sorted(ora) == sorted(nra):
                 conds = [f"{p}: {'/'.join(ora[p])} -> {'/'.join(nra[p])}" for p in sorted(ora) if ora[p] != nra[p]]
@@ -1814,7 +1836,10 @@ def assess(ctype, comp_old, comp_new, status, changes, flags, removed_parents=fr
                 parts.append(f"{len(ctrl_added)} control(s) added")
             if ctrl_removed:
                 parts.append(f"{len(ctrl_removed)} control(s) removed")
-            props = [c for c in cv if c["kind"] == "changed" and "/@" in c["path"] and not c["path"].endswith("/@template") and c["path"].startswith(("screen[", "component[", "app["))]
+            order = [c for c in cv if c["kind"] == "changed" and c["path"].endswith("/@child-order")]
+            if order:
+                parts.append(f"{len(order)} control order change(s)")
+            props = [c for c in cv if c["kind"] == "changed" and "/@" in c["path"] and not c["path"].endswith(("/@template", "/@child-order")) and c["path"].startswith(("screen[", "component[", "app["))]
             if props:
                 parts.append(f"{len(props)} property formula(s) changed")
             tmpls = [c for c in cv if c["kind"] == "changed" and c["path"].endswith("/@template")]
