@@ -382,8 +382,30 @@ def capped(items, cap=LIST_CAP, sep=", "):
     return sep.join(items[:cap]) + " and %d more" % (len(items) - cap)
 
 
+PRIVATE_KEY_BODY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----")
+
+
+def redact(text):
+    """Replace credential-shaped values with a labeled placeholder so no report carries a detected secret."""
+    text = PRIVATE_KEY_BODY.sub("[redacted private key block]", text)
+    for label, pat in SECRET_PATTERNS:
+        text = pat.sub("[redacted %s]" % label, text)
+    return text
+
+
+def redact_obj(obj):
+    """Apply redact() to every string inside nested dicts, lists, and tuples."""
+    if isinstance(obj, str):
+        return redact(obj)
+    if isinstance(obj, dict):
+        return obj.__class__((k, redact_obj(v)) for k, v in obj.items())
+    if isinstance(obj, (list, tuple)):
+        return [redact_obj(v) for v in obj]
+    return obj
+
+
 def short(text, cap=90):
-    text = " ".join(str(text).split())
+    text = redact(" ".join(str(text).split()))
     return text if len(text) <= cap else text[:cap - 1] + "…"
 
 
@@ -498,12 +520,12 @@ def bullet_fields(text):
     return out
 
 
-def table_rows(text):
-    """Rows of pipe tables in text (header and separator rows dropped), each a list of cells.
+def table_blocks(text):
+    """Pipe tables in text as (header_cells, rows) pairs, separator rows dropped.
 
     Accepts tables with or without outer pipes; a block counts as a table when its second line is a separator row.
     """
-    rows = []
+    blocks = []
     block = []
 
     def split_cells(line):
@@ -516,8 +538,7 @@ def table_rows(text):
 
     def flush():
         if len(block) >= 2 and all(TABLE_SEP.match(c or "-") for c in split_cells(block[1])):
-            for line in block[2:]:
-                rows.append(split_cells(line))
+            blocks.append((split_cells(block[0]), [split_cells(line) for line in block[2:]]))
         del block[:]
 
     for line in text.split("\n"):
@@ -526,7 +547,12 @@ def table_rows(text):
         else:
             flush()
     flush()
-    return rows
+    return blocks
+
+
+def table_rows(text):
+    """Rows of pipe tables in text (header and separator rows dropped), each a list of cells."""
+    return [row for _, rows in table_blocks(text) for row in rows]
 
 
 def field_table(text):
@@ -1023,15 +1049,25 @@ def model_review(art):
                          "destination_raw": dest_raw, "title": short(title.split(":", 1)[-1], 60), "line": i})
     m["findings"] = findings
     m["marker_ids"] = [mid for k, mid, _ in doc.markers if k == "review"]
-    decided, decisions = set(), {}
+    decided, decisions, final_dests = set(), {}, {}
     pdr = doc.section("Parent Decision Record")
-    for cells in table_rows(pdr):
-        if len(cells) >= 4 and RD_ID.search(cells[0]):
-            for rv in RV_ID.findall(cells[1]):
-                decided.add(rv)
-                decisions[rv] = cells[3]
+    for header, rows in table_blocks(pdr):
+        fin_col = next((i for i, h in enumerate(header) if h.strip().lower() == "final destination"), None)
+        for cells in rows:
+            if len(cells) >= 4 and RD_ID.search(cells[0]):
+                for rv in RV_ID.findall(cells[1]):
+                    decided.add(rv)
+                    decisions[rv] = cells[3]
+                    # the latest event for a subject governs; a recorded route replaces the reviewer's proposal, `none` removes it
+                    if fin_col is not None and fin_col < len(cells) and not is_placeholder_value(cells[fin_col]):
+                        route = vocab_match(cells[fin_col], DESTINATIONS)
+                        final_dests[rv] = route or ("none" if re.search(r"\bnone\b", cells[fin_col], re.I) else None)
     m["decided"] = sorted(decided)
     m["decisions"] = decisions
+    for f in findings:
+        fd = final_dests.get(f["id"])
+        f["final_destination"] = fd
+        f["route"] = f["destination"] if fd is None else (None if fd == "none" else fd)
     cur = bullet_fields(pdr)
     m["final_outcome_raw"] = cur.get("Final outcome", "")
     m["final_outcome"] = vocab_match(m["final_outcome_raw"], OUTCOMES)
@@ -1449,7 +1485,7 @@ class Audit:
         for kind in ("critique", "review"):
             for older in task[kind][:-1]:
                 for f in self.findings:
-                    if f.artifact == older.rel and f.severity != "info":
+                    if f.artifact == older.rel and f.severity != "info" and f.rule != "HY1":
                         f.severity = "info"
                         f.detail += " (superseded by %s)" % task[kind][-1].rel
         if changes and not plan:
@@ -1467,7 +1503,7 @@ class Audit:
                 if tid and not is_placeholder_value(tid):
                     ids[a.kind] = tid.strip("`")
         if len(set(ids.values())) > 1:
-            self.add("TK4", (plan or changes or review).rel, "; ".join("%s `%s`" % (k, v) for k, v in ids.items()), slug)
+            self.add("TK4", (plan or changes or review or critique).rel, "; ".join("%s `%s`" % (k, v) for k, v in ids.items()), slug)
         if plan is not None:
             pm = plan.model
             task_ids = {t["id"] for t in pm["tasks"]}
@@ -1495,7 +1531,8 @@ class Audit:
                         self.add("PL18", plan.rel, "`%s` [%s] from %s has no disposition row" % (pc, critique.model["severities"].get(pc) or "?", critique.rel), slug)
         latest_change = max([a.mtime for k in KIND_ORDER for a in task[k] if a.mtime], default=None)
         if latest_change and self.stale_days and not self.task_accepted(task) and (self.as_of - latest_change).days > self.stale_days:
-            self.add("TK6", (plan or research or changes or review).rel, "last change %s, %d days before the reference date" % (latest_change.isoformat(), (self.as_of - latest_change).days), slug)
+            anchor = plan or research or changes or review or next(task[k][-1] for k in KIND_ORDER if task[k])
+            self.add("TK6", anchor.rel, "last change %s, %d days before the reference date" % (latest_change.isoformat(), (self.as_of - latest_change).days), slug)
 
     def task_accepted(self, task):
         """True when the latest review's Parent Decision Record records a Conformant final outcome for the whole task."""
@@ -1573,7 +1610,7 @@ class Audit:
             row["review"] = "%s / %s" % (rm["execution"] or "?", rm["outcome"] or "?")
             row["final_outcome"] = "pending" if rm["final_pending"] else rm["final_outcome"]
             row["undecided"] = [f["id"] for f in rm["findings"] if f["id"] not in rm["decided"]]
-            row["routes"] = dict(Counter(f["destination"] or "unrouted" for f in rm["findings"]))
+            row["routes"] = dict(Counter(f["route"] or ("none" if f["final_destination"] == "none" else "unrouted") for f in rm["findings"]))
             row["review_scope"] = "bounded" if rm["bounded_scope"] else "full"
         else:
             row["review"] = "-"
@@ -1641,7 +1678,7 @@ class Audit:
             if rm["execution"] != "Complete":
                 return "/rpi-review task=%s plan=%s%s (review %s)" % (slug, plan.rel if plan else "<plan>", " changes=%s" % changes.rel if changes else "", rm["execution"] or "incomplete")
             live = [f for f in rm["findings"] if not re.search(r"\b(rejected|deferred)\b", rm["decisions"].get(f["id"], ""), re.I)]
-            dests = [d for d in DESTINATIONS if any(f["destination"] == d for f in live)]
+            dests = [d for d in DESTINATIONS if any(f["route"] == d for f in live)]
             cmds = []
             if "rpi-implement" in dests and plan:
                 cmds.append("/rpi-implement plan=%s" % plan.rel)
@@ -1846,8 +1883,8 @@ def render_inventory(audit, max_rows):
         review = Audit.latest(task, "review")
         if review is not None and review.model["findings"]:
             out.append("")
-            rrows = [(f["id"], f["severity"] or "-", f["title"], f["destination"] or "(unrouted)", short(review.model["decisions"].get(f["id"], "undecided"), 30)) for f in review.model["findings"]]
-            out.append(table(["Finding", "Severity", "Title", "Proposed destination", "Decision"], rrows, max_rows, "findings"))
+            rrows = [(f["id"], f["severity"] or "-", f["title"], f["destination"] or "(unrouted)", f["final_destination"] or "-", short(review.model["decisions"].get(f["id"], "undecided"), 30)) for f in review.model["findings"]]
+            out.append(table(["Finding", "Severity", "Title", "Proposed destination", "Final destination", "Decision"], rrows, max_rows, "findings"))
         out.append("")
     for slug, arts in audit.legacy_tasks.items():
         out.append("### %s (legacy)" % slug)
@@ -1916,7 +1953,8 @@ def render_method(audit, brief=False):
         "- The rules approximate the conventions in %s (read %s): the copilot-tracking instructions, the RPI skill templates and references, and the RPI Agent state contract. They are not HVE Core's own validation, which does not cover tracking files." % (HVE_CORE_SOURCE, HVE_CORE_READ_DATE),
         "- The VS Code extension (%s) ships the retired Task Researcher, Task Planner, Task Implementor, and Task Reviewer agents. Their artifacts are listed as legacy with checklist progress and are not audited." % HVE_EXTENSION_VERSION,
         "- Severity is a heuristic for ordering work: high means a downstream RPI phase cannot navigate the artifact or a secret is exposed; medium means artifacts disagree in a way that misleads a resume or bypasses a gate; low is convention; info is a fact for the board.",
-        "- The newest dated file of each kind is treated as the task's current artifact. Earlier ones are listed under TK5, and findings on a superseded critique or review are downgraded to info.",
+        "- The newest dated file of each kind is treated as the task's current artifact. Earlier ones are listed under TK5, and findings on a superseded critique or review are downgraded to info, except HY1.",
+        "- Values matching a credential pattern are replaced with `[redacted ...]` in this report and in the JSON; HY1 gives the file and line.",
         "- A task is `accepted` only when its plan and changes record exist, every plan task is checked, and the latest full-scope review's Parent Decision Record records a final outcome of Conformant or Conformant with justified divergence; the Executive Summary's assessed outcome is the reviewer's proposal.",
         "- Next actions are derived from the artifacts' own status fields and markers. They are suggestions for the user to confirm, not commands the script ran.",
         "- Staleness uses file modification time against the reference date; copying a folder resets it.",
@@ -1959,7 +1997,7 @@ def to_json(audit, single_path=None):
             m["sections"] = m.pop("h2")
         return {"path": a.rel, "kind": a.kind, "legacy_kind": a.legacy, "slug": a.slug, "date_dir": a.date_dir, "suffix_n": a.suffix_n,
                 "modified": a.mtime.isoformat() if a.mtime else None, "unrecognized": a.unrecognized, "model": m}
-    return {
+    return redact_obj({
         "tool": {"name": "hve_core_rpi_tracking_audit.py", "version": TOOL_VERSION, "hve_core_source": HVE_CORE_SOURCE, "read_date": HVE_CORE_READ_DATE, "extension_versions": HVE_EXTENSION_VERSION},
         "workspace": audit.root,
         "file": single_path,
@@ -1980,7 +2018,7 @@ def to_json(audit, single_path=None):
         "legacy_artifacts": [art_json(a) for a in audit.legacy],
         "state_files": [{"path": posix(os.path.relpath(p, audit.root)), "state": st} for p, st in audit.state_files],
         "rules": {k: {"title": v[0], "severity": v[1], "control": v[2]} for k, v in RULES.items()},
-    }
+    })
 
 
 # --------------------------------------------------------------------------
@@ -2036,7 +2074,7 @@ def main(argv=None):
             audit.legacy_board = [r for r in audit.legacy_board if r["slug"] == args.task]
     audit.finalize()
 
-    md = render_markdown(audit, brief=args.brief, max_rows=args.max_rows, single_path=single_path)
+    md = redact(render_markdown(audit, brief=args.brief, max_rows=args.max_rows, single_path=single_path))
     if args.md:
         with open(args.md, "w", encoding="utf-8") as fh:
             fh.write(md)

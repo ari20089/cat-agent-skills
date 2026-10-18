@@ -68,7 +68,7 @@ Each rule below names its **control**, the heading the report's remediation plan
 
 **TK4 Task ID differs across the task's artifacts.** Medium. *Why:* one stable task ID joins the set. TK4 compares within one slug; a renamed slug shows up as two tasks whose inventory summaries carry the same Task ID. *Fix:* align the Metadata of each file.
 
-**TK5 Several artifacts of one kind for one slug.** Info. *Why:* the newest is treated as current; the others may be superseded versions or a renamed task. Findings on an older critique or review that a `-2` file supersedes are downgraded to info with a "superseded by" note. *Fix:* confirm which is current.
+**TK5 Several artifacts of one kind for one slug.** Info. *Why:* the newest is treated as current; the others may be superseded versions or a renamed task. Findings on an older critique or review that a `-2` file supersedes are downgraded to info with a "superseded by" note, except HY1, which keeps its severity. *Fix:* confirm which is current.
 
 ## Decisions and gates (PL12, PL13, PL15, PL16, PL18, PL19, PC2, CH7, CH8, RV2, RV4, RV6, RV7, RS1, RS4, TK10)
 
@@ -128,7 +128,7 @@ Each rule below names its **control**, the heading the report's remediation plan
 
 ## Secrets (HY1)
 
-**HY1 Possible credential in a tracking artifact.** An AWS access key, GitHub token, private key block, Slack token, a quoted token or password assignment, or a connection string password. High. *Why:* tracking files are pasted into chats and reports, and the research self-check requires that no secrets are recorded. *Verify:* the quoted line; the pattern is a heuristic. *Fix:* remove the value and rotate it if it is real.
+**HY1 Possible credential in a tracking artifact.** An AWS access key, GitHub token, private key block, Slack token, a quoted token or password assignment, or a connection string password. High. *Why:* tracking files are pasted into chats and reports, and the research self-check requires that no secrets are recorded. *Verify:* the line named in the finding; the pattern is a heuristic. The report replaces the matched value with `[redacted ...]` in Markdown and JSON output and leaves the artifact unchanged. *Fix:* remove the value and rotate it if it is real.
 
 ## Not covered
 

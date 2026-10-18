@@ -50,7 +50,8 @@ How to read it:
 - **Review exec / assessed outcome** is the Executive Summary, which HVE Core labels the reviewer's proposal. **Final outcome** is Current Disposition. Quote both and keep them apart.
 - **Next action** is the command the artifacts' own fields imply, prefixed with a repair note when the task's artifacts carry high findings and suffixed when a blocker is recorded. Rejected and deferred review findings do not produce a route. It is a suggestion to confirm, not something the script ran.
 - **Legacy tasks** are listed with checklist progress and a re-plan suggestion; no rule other than LY9 runs on them.
-- **Superseded critiques and reviews** (an older file when a `-2` exists) keep their findings at info severity with a "superseded by" note.
+- **Superseded critiques and reviews** (an older file when a `-2` exists) keep their findings at info severity with a "superseded by" note, except HY1, which stays high.
+- **Redaction**: any value matching a credential pattern is replaced with `[redacted ...]` in both report formats. Do not look it up in the source file to quote it.
 - **Brief report** (`--brief`): six header rows (seven when legacy artifacts exist) plus the rules-not-evaluated row when any rule was skipped; the summary; a four-column board; the attention table; high and medium findings in three columns; one line per low or info rule without finding IDs; a one-line remediation plan per rule with finding IDs only for high and medium. When a user pastes a brief report and a question hangs on a low or info finding, ask for the full report or the JSON.
 - **Single-file report** (`--file`): paths are made relative to the parent of the nearest `.copilot-tracking` ancestor, every cross-artifact rule is listed as not evaluated, `--task` is refused, and files in the retired format are refused with a pointer to the workspace run.
 - **`--task SLUG`** keeps that task (current or legacy) plus workspace-level findings. A table ending "... and N more" is truncated; ask for `--max-rows` or the JSON before detailing that rule.
@@ -58,7 +59,7 @@ How to read it:
 ## Task status
 
 1. **State in one sentence**: the task, its state from the board, the phase reached, and the plan progress (checked over total tasks), citing the artifact paths.
-2. **What the artifacts say**: research readiness and disposition; plan readiness, critique verdict, open decisions; changes execution status, declared scope, blockers, remaining markers; review execution, assessed outcome, final outcome, review scope, undecided findings and their proposed destinations.
+2. **What the artifacts say**: research readiness and disposition; plan readiness, critique verdict, open decisions; changes execution status, declared scope, blockers, remaining markers; review execution, assessed outcome, final outcome, review scope, undecided findings, their proposed destinations, and any final destination recorded in Decision History.
 3. **Integrity**: high and medium findings on this task's artifacts with consequence and fix, each with its finding ID. If none, say the audit found no high or medium findings on N artifacts and name the rules not evaluated.
 4. **Next action**: the command from the board, with the arguments spelled out and the file each phase will write, plus what to open or reference first (the first unchecked dependency-ready task's blocks, the latest critique disposition, the Parent Decision Record).
 5. **To confirm**: anything only the user or the session knows (whether a decision was really theirs, whether validation ran, which host and HVE Core source).
@@ -102,7 +103,7 @@ End with one line saying the rules approximate HVE Core's documented conventions
 For a review record:
 
 1. Execution, assessed outcome, and final outcome as recorded, kept apart, and the review scope (full task or bounded).
-2. A table of `RV-xxx` findings with severity, proposed destination, and decision (or undecided).
+2. A table of `RV-xxx` findings with severity, proposed destination, final destination from Decision History (or `-`), and decision (or undecided).
 3. What each destination means in commands: `/rpi-implement plan=...` for defects, `/rpi-plan task=...` for decision gaps, `/rpi-research topic=...` for evidence gaps, a separate task for follow-ups. This matches HVE Core's own iteration table (Conformant: commit; Defects found: Implement; research gap: Research; decision gap: Plan; residual work: a follow-up owner). Rejected and deferred findings do not route.
 4. The findings that must be decided before the final outcome can be recorded, and whether the assessed outcome is consistent with the decisions so far (RV6).
 5. The validation evidence and its limitations.

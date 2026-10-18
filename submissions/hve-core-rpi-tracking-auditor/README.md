@@ -8,7 +8,7 @@ Microsoft's [HVE Core](https://github.com/microsoft/hve-core) (Hyper Velocity En
 - **A resume brief** for the next session: the command, what that phase reads first and writes, whether to start a fresh chat, and the repairs to make before running it.
 - **A handover** for a teammate: a board of tasks, the confirmed and open decisions, blockers, follow-ups, artifact paths, and what the files cannot carry (chat context, the RPI Agent's mode unless a state file records it).
 - **An integrity audit** against 67 rules across folder layout, plan markers and headings, completion evidence, cross-artifact links, decisions and gates, RPI Agent session state, template completion, and secrets, with findings ranked by severity and a remediation plan grouped by the control that fixes each rule. Examples of what it catches: a marker that does not match its heading; a phase checked over an unchecked task; a checked task with no changes entry; a plan marked ready without a critique result; a review assessed conformant with an undecided high finding or a pending final outcome; a state file pointing at a missing artifact; a token pasted into a research artifact.
-- **Review routing**: each `RV-xxx` finding with its severity, proposed destination (`rpi-implement`, `rpi-plan`, `rpi-research`, follow-up), and decision, and what must be decided before the final outcome can be recorded.
+- **Review routing**: each `RV-xxx` finding with its severity, proposed destination (`rpi-implement`, `rpi-plan`, `rpi-research`, follow-up), the final destination once Decision History records one, and decision, and what must be decided before the final outcome can be recorded.
 - **A single-artifact review** of one plan, critique, changes record, review record, or research file.
 - **A legacy inventory**: tasks written by the retired Task Planner agents (see below) listed with their checklist progress and a re-plan suggestion.
 
@@ -51,7 +51,7 @@ python3 scripts/hve_core_rpi_tracking_audit.py --file .copilot-tracking/plans/20
 - The RPI Agent's session state is a JSON file whose path HVE Core does not fix; the script recognizes it by its fields. If none is found, the agent's mode and participation preferences live only in the conversation that set them.
 - In the Copilot CLI the RPI Agent is selected with `/agent hve-core:rpi-agent`, and instruction files are not applied automatically, so formatting-convention findings on artifacts written there may come from the host rather than from drift.
 - Severity orders the work. It is this skill's heuristic, not a Microsoft rating and not a verdict on the task or the team. Each finding says what to confirm before acting.
-- Secrets detection covers a few exact token shapes and one assignment pattern. A clean result is not an assurance that no secret was recorded.
+- Secrets detection covers a few exact token shapes and one assignment pattern. Matched values are replaced with `[redacted ...]` in the Markdown and JSON reports, so a report can be pasted into a chat; the finding gives the file and line. A clean result is not an assurance that no secret was recorded.
 - Finding IDs (F1, F2, …) are numbered per run; a brief, task-filtered, or single-file run renumbers them, so quote the run you attach and cross-reference by rule ID.
 - For installing HVE Core, choosing components, writing agents and skills, or auditing `.github` customizations, use the HVE Core Adoption Advisor skill instead.
 
