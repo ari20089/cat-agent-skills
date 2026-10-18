@@ -25,7 +25,7 @@ python3 scripts/hve_core_rpi_tracking_audit.py . --task split-exporter         #
 python3 scripts/hve_core_rpi_tracking_audit.py --file .copilot-tracking/plans/2026-10-02/split-exporter-plan.md
 ```
 
-`--stale-days N` sets the threshold for reporting an open task as stale (default 30; 0 disables it), `--as-of YYYY-MM-DD` fixes the reference date, `--max-rows N` lengthens tables (default 25).
+`--stale-days N` sets the threshold for reporting an open task as stale (default 30; 0 disables it), `--as-of YYYY-MM-DD` fixes the reference date, `--max-rows N` lengthens tables (default 25). `--task` limits the whole report, session state files included, to one task, so it is safe to hand over. `--file` refuses a path that passes through a symbolic link.
 
 ## Example prompts
 
@@ -51,7 +51,7 @@ python3 scripts/hve_core_rpi_tracking_audit.py --file .copilot-tracking/plans/20
 - The RPI Agent's session state is a JSON file whose path HVE Core does not fix; the script recognizes it by its fields. If none is found, the agent's mode and participation preferences live only in the conversation that set them.
 - In the Copilot CLI the RPI Agent is selected with `/agent hve-core:rpi-agent`, and instruction files are not applied automatically, so formatting-convention findings on artifacts written there may come from the host rather than from drift.
 - Severity orders the work. It is this skill's heuristic, not a Microsoft rating and not a verdict on the task or the team. Each finding says what to confirm before acting.
-- Secrets detection covers a few exact token shapes and one assignment pattern. Matched values are replaced with `[redacted ...]` in the Markdown and JSON reports, so a report can be pasted into a chat; the finding gives the file and line. A clean result is not an assurance that no secret was recorded.
+- Secrets detection covers a few exact token shapes and one assignment pattern. Matched values are replaced with `[redacted ...]` before any field is parsed, in Markdown artifacts and in session state JSON (where a value under a key named like `token`, `password`, `secret`, or `api_key` is also replaced), so a report can be pasted into a chat; the finding gives the file and line. A clean result is not an assurance that no secret was recorded.
 - Finding IDs (F1, F2, …) are numbered per run; a brief, task-filtered, or single-file run renumbers them, so quote the run you attach and cross-reference by rule ID.
 - For installing HVE Core, choosing components, writing agents and skills, or auditing `.github` customizations, use the HVE Core Adoption Advisor skill instead.
 

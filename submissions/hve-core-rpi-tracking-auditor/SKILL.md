@@ -61,7 +61,7 @@ python3 scripts/hve_core_rpi_tracking_audit.py <repo-root> --task <slug>        
 python3 scripts/hve_core_rpi_tracking_audit.py --file .copilot-tracking/plans/2026-10-02/<slug>-plan.md
 ```
 
-Options: `--stale-days N` (default 30; 0 disables TK6 and records it as not evaluated), `--as-of YYYY-MM-DD` fixes the reference date, `--max-rows N` lengthens tables (default 25). `--task` cannot be combined with `--file`. The script needs Python 3.8 or later and nothing else, runs offline, follows no symbolic links (it lists the ones it skipped), and changes nothing.
+Options: `--stale-days N` (default 30; 0 disables TK6 and records it as not evaluated), `--as-of YYYY-MM-DD` fixes the reference date, `--max-rows N` lengthens tables (default 25). `--task` limits every section, including session state files, to that task; it cannot be combined with `--file`. `--file` refuses a path with a symbolic link anywhere below the workspace root. The script needs Python 3.8 or later and nothing else, runs offline, follows no symbolic links (it lists the ones it skipped), and changes nothing.
 
 The full report holds, in order:
 

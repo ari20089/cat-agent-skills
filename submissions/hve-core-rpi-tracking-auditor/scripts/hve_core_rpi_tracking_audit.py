@@ -93,7 +93,9 @@ SECRET_PATTERNS = (
     ("Slack token", re.compile(r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b")),
     ("quoted token or password assignment", re.compile(r"(?i)\b(?:pat|token|password|secret|api[_-]?key)\s*[=:]\s*['\"][A-Za-z0-9+/_\-]{20,}['\"]")),
     ("connection string with password", re.compile(r"(?i)\bpassword=[^;\s]{8,};")),
+    ("quoted key token or password (JSON)", re.compile(r"(?i)\"[\w-]*(?:pat|token|password|passwd|secret|api[_-]?key)\"\s*:\s*\"[A-Za-z0-9+/_\-]{20,}\"")),
 )
+SECRET_KEY = re.compile(r"(?i)(?:^|[_-])(?:pat|token|password|passwd|secret|api[_-]?key)$")
 
 AREAS = OrderedDict([
     ("research", ("research", re.compile(r"^(?P<slug>.+?)-research\.md$"))),
@@ -386,19 +388,20 @@ PRIVATE_KEY_BODY = re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KE
 
 
 def redact(text):
-    """Replace credential-shaped values with a labeled placeholder so no report carries a detected secret."""
-    text = PRIVATE_KEY_BODY.sub("[redacted private key block]", text)
+    """Replace credential-shaped values with a labeled placeholder; line count is preserved so line numbers stay valid."""
+    text = PRIVATE_KEY_BODY.sub(lambda mm: "[redacted private key block]" + "\n" * mm.group(0).count("\n"), text)
     for label, pat in SECRET_PATTERNS:
         text = pat.sub("[redacted %s]" % label, text)
     return text
 
 
 def redact_obj(obj):
-    """Apply redact() to every string inside nested dicts, lists, and tuples."""
+    """Apply redact() to every string inside nested dicts, lists, and tuples; a string under a key named like a credential is replaced whole."""
     if isinstance(obj, str):
         return redact(obj)
     if isinstance(obj, dict):
-        return obj.__class__((k, redact_obj(v)) for k, v in obj.items())
+        return obj.__class__((k, "[redacted value of %s]" % k if isinstance(k, str) and isinstance(v, str) and len(v) >= 8 and SECRET_KEY.search(k) else redact_obj(v))
+                             for k, v in obj.items())
     if isinstance(obj, (list, tuple)):
         return [redact_obj(v) for v in obj]
     return obj
@@ -679,7 +682,8 @@ class Artifact:
         self.slug = slug
         self.date_dir = date_dir
         self.suffix_n = suffix_n
-        self.text = read_text(path)
+        self.raw_text = read_text(path)
+        self.text = redact(self.raw_text)   # every parsed field derives from the redacted text; HY1 scans raw_text
         self.doc = Doc(self.text)
         self.mtime = file_mtime(path)
         self.model = {}
@@ -839,7 +843,7 @@ def load_state(path):
     except (OSError, ValueError):
         return None
     if isinstance(data, dict) and STATE_FIELDS.issubset(set(data.keys())):
-        return data
+        return redact_obj(data)
     return None
 
 
@@ -1161,6 +1165,13 @@ class Audit:
         self.findings.append(f)
         return f
 
+    def scan_secrets(self, raw, rel, slug):
+        for label, pat in SECRET_PATTERNS:
+            mm = pat.search(raw)
+            if mm:
+                self.add("HY1", rel, "%s pattern at line %d" % (label, raw.count("\n", 0, mm.start()) + 1), slug)
+                break
+
     def skip(self, rule, reason):
         self.not_evaluated.setdefault(rule, reason)
 
@@ -1241,6 +1252,12 @@ class Audit:
             probe = parent
         root = root or os.path.dirname(abs_path)
         self.root = root
+        # the no-follow boundary applies to every component below the workspace root, not only the file itself
+        probe = abs_path
+        while probe != root and os.path.dirname(probe) != probe:
+            if os.path.islink(probe):
+                raise SystemExit("--file refuses a path through a symbolic link: %s (the audit follows no links)" % posix(os.path.relpath(probe, root)))
+            probe = os.path.dirname(probe)
         date_dir = os.path.basename(os.path.dirname(abs_path))
         art = Artifact(root, abs_path, area, kind, slug, date_dir, n)
         art.model["date_ok"] = DATE_DIR.match(date_dir) is not None
@@ -1285,11 +1302,7 @@ class Audit:
             self.add("LY7", rel, "`%s`" % short(ref, 50), slug)
         if FILE_DIRECTIVE.search(body):
             self.add("LY8", rel, "`#file:` used in a tracking artifact", slug)
-        for label, pat in SECRET_PATTERNS:
-            mm = pat.search(art.text)
-            if mm:
-                self.add("HY1", rel, "%s pattern at line %d" % (label, art.text.count("\n", 0, mm.start()) + 1), slug)
-                break
+        self.scan_secrets(art.raw_text, rel, slug)
         placeholders = sorted(set(PLACEHOLDER.findall(body)))
         if placeholders:
             sev = "medium" if art.kind in ("plan", "changes", "review", "critique") else "low"
@@ -1551,6 +1564,7 @@ class Audit:
             rel = posix(os.path.relpath(path, self.root))
             slug = st.get("task_slug")
             slug = slug if isinstance(slug, str) and slug else None
+            self.scan_secrets(read_text(path), rel, slug)
             paths = st.get("artifact_paths") or {}
             if isinstance(paths, dict):
                 for key, p in paths.items():
@@ -1954,7 +1968,7 @@ def render_method(audit, brief=False):
         "- The VS Code extension (%s) ships the retired Task Researcher, Task Planner, Task Implementor, and Task Reviewer agents. Their artifacts are listed as legacy with checklist progress and are not audited." % HVE_EXTENSION_VERSION,
         "- Severity is a heuristic for ordering work: high means a downstream RPI phase cannot navigate the artifact or a secret is exposed; medium means artifacts disagree in a way that misleads a resume or bypasses a gate; low is convention; info is a fact for the board.",
         "- The newest dated file of each kind is treated as the task's current artifact. Earlier ones are listed under TK5, and findings on a superseded critique or review are downgraded to info, except HY1.",
-        "- Values matching a credential pattern are replaced with `[redacted ...]` in this report and in the JSON; HY1 gives the file and line.",
+        "- Values matching a credential pattern are replaced with `[redacted ...]` before any field is parsed, so neither this report nor the JSON carries them; HY1 gives the file and line.",
         "- A task is `accepted` only when its plan and changes record exist, every plan task is checked, and the latest full-scope review's Parent Decision Record records a final outcome of Conformant or Conformant with justified divergence; the Executive Summary's assessed outcome is the reviewer's proposal.",
         "- Next actions are derived from the artifacts' own status fields and markers. They are suggestions for the user to confirm, not commands the script ran.",
         "- Staleness uses file modification time against the reference date; copying a folder resets it.",
@@ -2065,7 +2079,9 @@ def main(argv=None):
         if args.task:
             if args.task not in audit.tasks and args.task not in audit.legacy_tasks:
                 raise SystemExit("no task `%s`; tasks found: %s" % (args.task, ", ".join(list(audit.tasks) + list(audit.legacy_tasks)) or "none"))
-            audit.findings = [f for f in audit.findings if f.slug in (args.task, None)]
+            dropped = {posix(os.path.relpath(p, audit.root)) for p, st in audit.state_files if st.get("task_slug") != args.task}
+            audit.state_files = [(p, st) for p, st in audit.state_files if st.get("task_slug") == args.task]
+            audit.findings = [f for f in audit.findings if f.slug == args.task or (f.slug is None and f.artifact not in dropped)]
             audit.tasks = OrderedDict([(args.task, audit.tasks[args.task])]) if args.task in audit.tasks else OrderedDict()
             audit.legacy_tasks = OrderedDict([(args.task, audit.legacy_tasks[args.task])]) if args.task in audit.legacy_tasks else OrderedDict()
             audit.artifacts = [a for a in audit.artifacts if a.slug == args.task]
